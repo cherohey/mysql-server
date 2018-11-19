@@ -84,11 +84,6 @@ bool Query_result_union::prepare(List<Item> &, SELECT_LEX_UNIT *u) {
 }
 
 bool Query_result_union::send_data(List<Item> &values) {
-  // Skip "offset" number of rows before producing rows
-  if (unit->offset_limit_cnt > 0) {
-    unit->offset_limit_cnt--;
-    return false;
-  }
   if (fill_record(thd, table, table->visible_field_ptr(), values, NULL, NULL))
     return true; /* purecov: inspected */
 
@@ -115,14 +110,7 @@ bool Query_result_union::send_data(List<Item> &values) {
 
 bool Query_result_union::send_eof() { return false; }
 
-bool Query_result_union::flush() {
-  const int error = table->file->extra(HA_EXTRA_NO_CACHE);
-  if (error) {
-    table->file->print_error(error, MYF(0)); /* purecov: inspected */
-    return true;                             /* purecov: inspected */
-  }
-  return false;
-}
+bool Query_result_union::flush() { return false; }
 
 /**
   Create a temporary table to store the result of Query_result_union.
@@ -180,7 +168,6 @@ bool Query_result_union::create_result_table(
                                  (char *)table_alias)))
     return true;
   if (create_table) {
-    table->file->extra(HA_EXTRA_WRITE_CACHE);
     table->file->extra(HA_EXTRA_IGNORE_DUP_KEY);
     if (table->hash_field) table->file->ha_index_init(0, 0);
   }
@@ -246,7 +233,9 @@ class Query_result_union_direct final : public Query_result_union {
         optimized(false),
         result_set_metadata_sent(false),
         execution_started(false),
-        current_found_rows(0) {}
+        current_found_rows(0) {
+    unit = last_select_lex->master_unit();
+  }
   bool change_query_result(Query_result *new_result) override;
   uint field_count(List<Item> &) const override {
     // Only called for top-level Query_results, usually Query_result_send

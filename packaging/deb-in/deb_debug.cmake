@@ -37,12 +37,12 @@ SET (DEB_RULES_DEBUG_CMAKE
 		-DINSTALL_SBINDIR=sbin \\
 		-DSYSCONFDIR=/etc/mysql \\
 		-DMYSQL_UNIX_ADDR=/var/run/mysqld/mysqld.sock \\
-		-DWITH_SSL=bundled \\
 		-DWITH_INNODB_MEMCACHED=1 \\
 		-DWITH_MECAB=system \\
 		-DWITH_NUMA=ON \\
 		-DCOMPILATION_COMMENT=\"MySQL ${DEB_PRODUCTNAMEC} Server - ${DEB_LICENSENAME} - Debug\" \\
 		-DINSTALL_LAYOUT=DEB \\
+		-DREPRODUCIBLE_BUILD=OFF \\
 		-DDEB_PRODUCT=${DEB_PRODUCT} \\
 		${DEB_CMAKE_EXTRAS}
 ")
@@ -117,6 +117,7 @@ usr/lib/mysql/plugin/debug/component_udf_unreg_int_func.so
 usr/lib/mysql/plugin/debug/component_udf_unreg_real_func.so
 usr/lib/mysql/plugin/debug/daemon_example.ini
 usr/lib/mysql/plugin/debug/ha_example.so
+usr/lib/mysql/plugin/debug/ha_mock.so
 usr/lib/mysql/plugin/debug/libdaemon_example.so
 usr/lib/mysql/plugin/debug/libtest_framework.so
 usr/lib/mysql/plugin/debug/libtest_services.so

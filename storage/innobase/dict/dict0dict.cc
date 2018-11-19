@@ -49,7 +49,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #endif /* !UNIV_HOTBACKUP */
 #include "ha_prototypes.h"
 #include "my_dbug.h"
-#include "my_inttypes.h"
+
 #ifndef UNIV_HOTBACKUP
 #include "clone0api.h"
 #include "mysqld.h"  // system_charset_info
@@ -121,6 +121,13 @@ extern uint ibuf_debug;
 #include "trx0undo.h"
 #include "ut0new.h"
 #endif /* !UNIV_HOTBACKUP */
+
+static_assert(DATA_ROW_ID == 0, "DATA_ROW_ID != 0");
+static_assert(DATA_TRX_ID == 1, "DATA_TRX_ID != 1");
+static_assert(DATA_ROLL_PTR == 2, "DATA_ROLL_PTR != 2");
+static_assert(DATA_N_SYS_COLS == 3, "DATA_N_SYS_COLS != 3");
+static_assert(DATA_TRX_ID_LEN == 6, "DATA_TRX_ID_LEN != 6");
+static_assert(DATA_ITT_N_SYS_COLS == 2, "DATA_ITT_N_SYS_COLS != 2");
 
 /** the dictionary system */
 dict_sys_t *dict_sys = NULL;
@@ -509,10 +516,9 @@ void dict_table_close(dict_table_t *table, /*!< in/out: table */
 #endif /* !UNIV_HOTBACKUP */
 
   if (!table->is_intrinsic()) {
-    /* Ask for mutex to prevent concurrent ha_innobase::open(),
+    /* Ask for lock to prevent concurrent table open,
     in case the race of n_ref_count and stat_initialized in
-    dict_stats_deinit(). As long as we protect change to
-    n_ref_count in ha_innobase:open() too, there should be no race.
+    dict_stats_deinit(). See dict_table_t::acquire_with_lock() too.
     We don't actually need dict_sys mutex any more here. */
     table->lock();
   }
@@ -1142,31 +1148,15 @@ void dict_table_add_system_columns(dict_table_t *table, /*!< in/out: table */
   dict_mem_table_add_col(table, heap, "DB_ROW_ID", DATA_SYS,
                          DATA_ROW_ID | DATA_NOT_NULL, DATA_ROW_ID_LEN);
 
-#if (DATA_ITT_N_SYS_COLS != 2)
-#error "DATA_ITT_N_SYS_COLS != 2"
-#endif
-
-#if DATA_ROW_ID != 0
-#error "DATA_ROW_ID != 0"
-#endif
   dict_mem_table_add_col(table, heap, "DB_TRX_ID", DATA_SYS,
                          DATA_TRX_ID | DATA_NOT_NULL, DATA_TRX_ID_LEN);
-#if DATA_TRX_ID != 1
-#error "DATA_TRX_ID != 1"
-#endif
 
   if (!table->is_intrinsic()) {
     dict_mem_table_add_col(table, heap, "DB_ROLL_PTR", DATA_SYS,
                            DATA_ROLL_PTR | DATA_NOT_NULL, DATA_ROLL_PTR_LEN);
-#if DATA_ROLL_PTR != 2
-#error "DATA_ROLL_PTR != 2"
-#endif
 
     /* This check reminds that if a new system column is added to
     the program, it should be dealt with here */
-#if DATA_N_SYS_COLS != 3
-#error "DATA_N_SYS_COLS != 3"
-#endif
   }
 }
 
@@ -2512,6 +2502,15 @@ dberr_t dict_index_add_to_cache_w_vcol(dict_table_t *table, dict_index_t *index,
     }
   }
 
+  if (new_index->table->has_instant_cols() && new_index->is_clustered()) {
+    new_index->instant_cols = true;
+    new_index->n_instant_nullable =
+        new_index->get_n_nullable_before(new_index->get_instant_fields());
+  } else {
+    new_index->instant_cols = false;
+    new_index->n_instant_nullable = new_index->n_nullable;
+  }
+
   dict_mem_index_free(index);
 
   return (DB_SUCCESS);
@@ -2892,16 +2891,6 @@ static dict_index_t *dict_index_build_internal_clust(
   /* Add system columns, trx id first */
 
   trx_id_pos = new_index->n_def;
-
-#if DATA_ROW_ID != 0
-#error "DATA_ROW_ID != 0"
-#endif
-#if DATA_TRX_ID != 1
-#error "DATA_TRX_ID != 1"
-#endif
-#if DATA_ROLL_PTR != 2
-#error "DATA_ROLL_PTR != 2"
-#endif
 
   if (!dict_index_is_unique(index)) {
     dict_index_add_col(new_index, table, table->get_sys_col(DATA_ROW_ID), 0,
@@ -4216,16 +4205,8 @@ col_loop1:
       dict_foreign_find_index(table, NULL, column_names, i, NULL, TRUE, FALSE);
 
   if (!index) {
-    mutex_enter(&dict_foreign_err_mutex);
-    dict_foreign_error_report_low(ef, name);
-    fputs("There is no index in table ", ef);
-    ut_print_name(ef, NULL, name);
-    fprintf(ef,
-            " where the columns appear\n"
-            "as the first columns. Constraint:\n%s\n%s",
-            start_of_latest_foreign, FOREIGN_KEY_CONSTRAINTS_MSG);
-    mutex_exit(&dict_foreign_err_mutex);
-
+    /* SQL-layer already has checked that proper index exists.*/
+    ut_ad(0);
     return (DB_CHILD_NO_INDEX);
   }
   ptr = dict_accept(cs, ptr, "REFERENCES", &success);
@@ -4242,13 +4223,21 @@ col_loop1:
     if (success && my_isspace(cs, *ptr1)) {
       ptr2 = dict_accept(cs, ptr1, "BY", &success);
       if (success) {
-        my_error(ER_FOREIGN_KEY_ON_PARTITIONED, MYF(0));
+        /*
+          SQL-layer disallows foreign keys on partitioned tables
+          unless storage engine supports such FKs explicitly.
+        */
+        ut_ad(0);
         return (DB_CANNOT_ADD_CONSTRAINT);
       }
     }
   }
   if (dict_table_is_partition(table)) {
-    my_error(ER_FOREIGN_KEY_ON_PARTITIONED, MYF(0));
+    /*
+      This is ALTER TABLE which adds foreign key to partitioned table.
+      SQL-layer should have blocked this already.
+    */
+    ut_ad(0);
     return (DB_CANNOT_ADD_CONSTRAINT);
   }
 
@@ -4332,7 +4321,6 @@ col_loop1:
   if (referenced_table && dict_table_is_partition(referenced_table)) {
     /* How could one make a referenced table to be a partition? */
     ut_ad(0);
-    my_error(ER_FOREIGN_KEY_ON_PARTITIONED, MYF(0));
     return (DB_CANNOT_ADD_CONSTRAINT);
   }
 
@@ -4483,21 +4471,12 @@ scan_on_conditions:
   for (j = 0; j < foreign->n_fields; j++) {
     if ((foreign->foreign_index->get_col(j)->prtype) & DATA_NOT_NULL) {
       /* It is not sensible to define SET NULL
-      if the column is not allowed to be NULL! */
+      if the column is not allowed to be NULL!
+      SQL-layer already enforces this. */
+      ut_ad(0);
       if (referenced_table) {
         dd_table_close(referenced_table, current_thd, &mdl, true);
       }
-
-      mutex_enter(&dict_foreign_err_mutex);
-      dict_foreign_error_report_low(ef, name);
-      fprintf(ef,
-              "%s:\n"
-              "You have defined a SET NULL condition"
-              " though some of the\n"
-              "columns are defined as NOT NULL.\n",
-              start_of_latest_foreign);
-      mutex_exit(&dict_foreign_err_mutex);
-
       return (DB_CANNOT_ADD_CONSTRAINT);
     }
   }
@@ -4800,7 +4779,7 @@ dtuple_t *dict_index_build_node_ptr(
     contains the page number of the child page */
 
     ut_a(!dict_table_is_comp(index->table));
-    n_unique = rec_get_n_fields_old(rec);
+    n_unique = rec_get_n_fields_old_raw(rec);
 
     if (level > 0) {
       ut_a(n_unique > 1);
@@ -4858,7 +4837,7 @@ rec_t *dict_index_copy_rec_order_prefix(
 
   if (dict_index_is_ibuf(index)) {
     ut_a(!dict_table_is_comp(index->table));
-    n = rec_get_n_fields_old(rec);
+    n = rec_get_n_fields_old_raw(rec);
   } else {
     if (page_is_leaf(page_align(rec))) {
       n = dict_index_get_n_unique_in_tree(index);
@@ -4888,7 +4867,7 @@ dtuple_t *dict_index_build_data_tuple(
   dtuple_t *tuple;
 
   ut_ad(dict_table_is_comp(index->table) ||
-        n_fields <= rec_get_n_fields_old(rec));
+        n_fields <= rec_get_n_fields_old(rec, index));
 
   tuple = dtuple_create(heap, n_fields);
 
@@ -5018,11 +4997,11 @@ void dict_print_info_on_foreign_key_in_create_format(
     fputs(" ON DELETE SET NULL", file);
   }
 
-#ifdef HAS_RUNTIME_WL6049
-  if (foreign->type & DICT_FOREIGN_ON_DELETE_NO_ACTION) {
-    fputs(" ON DELETE NO ACTION", file);
+  if (!(foreign->type & DICT_FOREIGN_ON_DELETE_NO_ACTION) &&
+      !(foreign->type & DICT_FOREIGN_ON_DELETE_CASCADE) &&
+      !(foreign->type & DICT_FOREIGN_ON_DELETE_SET_NULL)) {
+    fputs(" ON DELETE RESTRICT", file);
   }
-#endif /* HAS_RUNTIME_WL6049 */
 
   if (foreign->type & DICT_FOREIGN_ON_UPDATE_CASCADE) {
     fputs(" ON UPDATE CASCADE", file);
@@ -5032,11 +5011,11 @@ void dict_print_info_on_foreign_key_in_create_format(
     fputs(" ON UPDATE SET NULL", file);
   }
 
-#ifdef HAS_RUNTIME_WL6049
-  if (foreign->type & DICT_FOREIGN_ON_UPDATE_NO_ACTION) {
-    fputs(" ON UPDATE NO ACTION", file);
+  if (!(foreign->type & DICT_FOREIGN_ON_UPDATE_NO_ACTION) &&
+      !(foreign->type & DICT_FOREIGN_ON_UPDATE_CASCADE) &&
+      !(foreign->type & DICT_FOREIGN_ON_UPDATE_SET_NULL)) {
+    fputs(" ON UPDATE RESTRICT", file);
   }
-#endif /* HAS_RUNTIME_WL6049 */
 }
 
 /** Outputs info on foreign keys of a table. */
@@ -6217,9 +6196,8 @@ Other bits are the same.
 dict_table_t::flags |     0     |    1    |     1      |    1
 fil_space_t::flags  |     0     |    0    |     1      |    1
 @param[in]	table_flags	dict_table_t::flags
-@param[in]	is_encrypted	if it's an encrypted table
 @return tablespace flags (fil_space_t::flags) */
-ulint dict_tf_to_fsp_flags(ulint table_flags, bool is_encrypted) {
+ulint dict_tf_to_fsp_flags(ulint table_flags) {
   DBUG_EXECUTE_IF("dict_tf_to_fsp_flags_failure", return (ULINT_UNDEFINED););
 
   bool has_atomic_blobs = DICT_TF_HAS_ATOMIC_BLOBS(table_flags);
@@ -6236,7 +6214,7 @@ ulint dict_tf_to_fsp_flags(ulint table_flags, bool is_encrypted) {
   }
 
   ulint fsp_flags = fsp_flags_init(page_size, has_atomic_blobs, has_data_dir,
-                                   is_shared, false, is_encrypted);
+                                   is_shared, false);
 
   return (fsp_flags);
 }
@@ -6258,7 +6236,6 @@ const char *dict_tf_to_row_format_string(
   }
 
   ut_error;
-  return (0);
 }
 
 /** Determine the extent size (in pages) for the given table
@@ -6381,6 +6358,7 @@ void DDTableBuffer::init() {
 
   m_heap = mem_heap_create(500);
   m_dynamic_heap = mem_heap_create(1000);
+  m_replace_heap = mem_heap_create(1000);
 
   create_tuples();
 }
@@ -6479,6 +6457,7 @@ void DDTableBuffer::init_tuple_with_id(dtuple_t *tuple, table_id_t id) {
 void DDTableBuffer::close() {
   mem_heap_free(m_heap);
   mem_heap_free(m_dynamic_heap);
+  mem_heap_free(m_replace_heap);
 
   m_search_tuple = NULL;
   m_replace_tuple = NULL;
@@ -6517,7 +6496,7 @@ upd_t *DDTableBuffer::update_set_metadata(const dtuple_t *entry,
     return (nullptr);
   }
 
-  update = upd_create(2, m_dynamic_heap);
+  update = upd_create(2, m_replace_heap);
 
   upd_field = upd_get_nth_field(update, 0);
   dfield_copy(&upd_field->new_val, version_field);
@@ -6559,7 +6538,7 @@ dberr_t DDTableBuffer::replace(table_id_t id, uint64_t version,
   dfield_set_data(dfield, metadata, len);
   /* Other system fields have been initialized */
 
-  entry = row_build_index_entry(m_replace_tuple, NULL, m_index, m_dynamic_heap);
+  entry = row_build_index_entry(m_replace_tuple, NULL, m_index, m_replace_heap);
 
   /* Start to search for the to-be-replaced tuple */
   mtr.start();
@@ -6582,6 +6561,7 @@ dberr_t DDTableBuffer::replace(table_id_t id, uint64_t version,
     ut_a(error == DB_SUCCESS);
 
     mem_heap_empty(m_dynamic_heap);
+    mem_heap_empty(m_replace_heap);
 
     return (DB_SUCCESS);
   }
@@ -6600,7 +6580,7 @@ dberr_t DDTableBuffer::replace(table_id_t id, uint64_t version,
 
     error = btr_cur_pessimistic_update(
         flags, btr_pcur_get_btr_cur(&pcur), &cur_offsets, &m_dynamic_heap,
-        m_dynamic_heap, &big_rec, update, 0, NULL, 0, 0, &mtr);
+        m_replace_heap, &big_rec, update, 0, NULL, 0, 0, &mtr);
     ut_a(error == DB_SUCCESS);
     /* We don't have big rec in this table */
     ut_ad(!big_rec);
@@ -6608,6 +6588,7 @@ dberr_t DDTableBuffer::replace(table_id_t id, uint64_t version,
 
   mtr.commit();
   mem_heap_empty(m_dynamic_heap);
+  mem_heap_empty(m_replace_heap);
 
   return (DB_SUCCESS);
 }
@@ -6661,7 +6642,7 @@ std::string *DDTableBuffer::get(table_id_t id, uint64 *version) {
   btr_cur_t cursor;
   mtr_t mtr;
   ulint len;
-  byte *field = NULL;
+  const byte *field = NULL;
 
   ut_ad(mutex_own(&dict_persist->mutex));
 

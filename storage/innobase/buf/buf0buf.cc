@@ -750,7 +750,6 @@ static void buf_block_init(
 
   block->index = NULL;
   block->made_dirty_with_no_latch = false;
-  block->skip_flush_check = false;
 
   ut_d(block->page.in_page_hash = FALSE);
   ut_d(block->page.in_zip_hash = FALSE);
@@ -797,7 +796,7 @@ static void buf_block_init(
 static buf_chunk_t *buf_chunk_init(
     buf_pool_t *buf_pool, /*!< in: buffer pool instance */
     buf_chunk_t *chunk,   /*!< out: chunk of buffers */
-    ulint mem_size,       /*!< in: requested size in bytes */
+    ulonglong mem_size,   /*!< in: requested size in bytes */
     std::mutex *mutex)    /*!< in,out: Mutex protecting chunk map. */
 {
   buf_block_t *block;
@@ -1810,10 +1809,9 @@ static void buf_pool_resize() {
   new_instance_size = srv_buf_pool_size / srv_buf_pool_instances;
   new_instance_size /= UNIV_PAGE_SIZE;
 
-  buf_resize_status("Resizing buffer pool from " ULINTPF " to " ULINTPF
-                    " (unit=" ULINTPF ").",
-                    srv_buf_pool_old_size, srv_buf_pool_size,
-                    srv_buf_pool_chunk_unit);
+  buf_resize_status(
+      "Resizing buffer pool from " ULINTPF " to " ULINTPF " (unit=%llu).",
+      srv_buf_pool_old_size, srv_buf_pool_size, srv_buf_pool_chunk_unit);
 
   /* set new limit for all buffer pool for resizing */
   for (ulint i = 0; i < srv_buf_pool_instances; i++) {
@@ -2101,7 +2099,7 @@ withdraw_retry:
       ulint n_chunks = buf_pool->n_chunks;
 
       while (chunk < echunk) {
-        ulong unit = srv_buf_pool_chunk_unit;
+        ulonglong unit = srv_buf_pool_chunk_unit;
 
         if (!buf_chunk_init(buf_pool, chunk, unit, nullptr)) {
           ib::error(ER_IB_MSG_65) << "buffer pool " << i
@@ -2635,9 +2633,6 @@ static buf_page_t *buf_pool_watch_set(const page_id_t &page_id,
   should be modified to return a special non-NULL value and the
   caller should purge the record directly. */
   ut_error;
-
-  /* Fix compiler warning */
-  return (NULL);
 }
 
 /** Remove the sentinel block for the watch before replacing it with a
@@ -2970,7 +2965,6 @@ void buf_block_init_low(buf_block_t *block) /*!< in: block to init */
   assert_block_ahi_empty_on_init(block);
   block->index = NULL;
   block->made_dirty_with_no_latch = false;
-  block->skip_flush_check = false;
 
   block->n_hash_helps = 0;
   block->n_fields = 1;
@@ -4362,16 +4356,9 @@ func_exit:
   return (bpage);
 }
 
-/** Initializes a page to the buffer buf_pool. The page is usually not read
-from a file even if it cannot be found in the buffer buf_pool. This is one
-of the functions which perform to a block a state transition NOT_USED =>
-FILE_PAGE (the other is buf_page_get_gen).
-@param[in]	page_id		page id
-@param[in]	page_size	page size
-@param[in]	mtr		mini-transaction
-@return pointer to the block, page bufferfixed */
 buf_block_t *buf_page_create(const page_id_t &page_id,
-                             const page_size_t &page_size, mtr_t *mtr) {
+                             const page_size_t &page_size,
+                             rw_lock_type_t rw_latch, mtr_t *mtr) {
   buf_frame_t *frame;
   buf_block_t *block;
   buf_block_t *free_block = NULL;
@@ -4404,7 +4391,7 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
 
     buf_block_free(free_block);
 
-    return (buf_page_get_with_no_latch(page_id, page_size, mtr));
+    return (buf_page_get(page_id, page_size, rw_latch, mtr));
   }
 
   /* If we get here, the page was not in buf_pool: init it there */
@@ -4418,32 +4405,44 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
 
   buf_page_init(buf_pool, page_id, page_size, block);
 
+  buf_block_buf_fix_inc(block, __FILE__, __LINE__);
+
+  buf_page_set_accessed(&block->page);
+
+  mutex_exit(&block->mutex);
+
+  /* Latch the page before releasing hash lock so that concurrent request for
+  this page doesn't see half initialized page. ALTER tablespace for encryption
+  and clone page copy can request page for any page id within tablespace
+  size limit. */
+  mtr_memo_type_t mtr_latch_type;
+
+  if (rw_latch == RW_X_LATCH) {
+    rw_lock_x_lock(&block->lock);
+    mtr_latch_type = MTR_MEMO_PAGE_X_FIX;
+  } else {
+    rw_lock_sx_lock(&block->lock);
+    mtr_latch_type = MTR_MEMO_PAGE_SX_FIX;
+  }
+  mtr_memo_push(mtr, block, mtr_latch_type);
+
   rw_lock_x_unlock(hash_lock);
 
   /* The block must be put to the LRU list */
   buf_LRU_add_block(&block->page, FALSE);
 
-  buf_block_buf_fix_inc(block, __FILE__, __LINE__);
   os_atomic_increment_ulint(&buf_pool->stat.n_pages_created, 1);
 
   if (page_size.is_compressed()) {
-    void *data;
-
-    /* Prevent race conditions during buf_buddy_alloc(),
-    which may release and reacquire buf_pool->LRU_list_mutex,
-    by IO-fixing and X-latching the block. */
-
-    buf_page_set_io_fix(&block->page, BUF_IO_READ);
-    rw_lock_x_lock(&block->lock);
-
     mutex_exit(&buf_pool->LRU_list_mutex);
-    buf_page_mutex_exit(block);
 
-    data = buf_buddy_alloc(buf_pool, page_size.physical());
+    auto data = buf_buddy_alloc(buf_pool, page_size.physical());
 
     mutex_enter(&buf_pool->LRU_list_mutex);
+
     buf_page_mutex_enter(block);
     block->page.zip.data = (page_zip_t *)data;
+    buf_page_mutex_exit(block);
 
     /* To maintain the invariant
     block->in_unzip_LRU_list
@@ -4452,18 +4451,9 @@ buf_block_t *buf_page_create(const page_id_t &page_id,
     block->page.zip.data is set. */
     ut_ad(buf_page_belongs_to_unzip_LRU(&block->page));
     buf_unzip_LRU_add_block(block, FALSE);
-
-    buf_page_set_io_fix(&block->page, BUF_IO_NONE);
-    rw_lock_x_unlock(&block->lock);
   }
 
   mutex_exit(&buf_pool->LRU_list_mutex);
-
-  mtr_memo_push(mtr, block, MTR_MEMO_BUF_FIX);
-
-  buf_page_set_accessed(&block->page);
-
-  buf_page_mutex_exit(block);
 
   /* Delete possible entries for the page from the insert buffer:
   such can exist if the page belonged to an index which was dropped */
@@ -5899,7 +5889,7 @@ std::ostream &operator<<(std::ostream &out, const buf_pool_t &buf_pool) {
 /** Get the page type as a string.
 @return the page type as a string. */
 const char *buf_block_t::get_page_type_str() const {
-  ulint type = get_page_type();
+  page_type_t type = get_page_type();
 
 #define PAGE_TYPE(x) \
   case x:            \

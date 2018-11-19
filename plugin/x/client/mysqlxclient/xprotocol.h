@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2018, Oracle and/or its affiliates. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2.0,
@@ -25,8 +25,8 @@
 // MySQL DB access module, for use by plugins and others
 // For the module that implements interactive DB functionality see mod_db
 
-#ifndef X_CLIENT_MYSQLXCLIENT_XPROTOCOL_H_
-#define X_CLIENT_MYSQLXCLIENT_XPROTOCOL_H_
+#ifndef PLUGIN_X_CLIENT_MYSQLXCLIENT_XPROTOCOL_H_
+#define PLUGIN_X_CLIENT_MYSQLXCLIENT_XPROTOCOL_H_
 
 #include <functional>
 #include <memory>
@@ -585,14 +585,15 @@ class XProtocol {
 
     Create and return an object which already fetched metadata.
     If server returns an error or an I/O error occurred then
-    the result is "nullptr".
+    the function returns a valid object, the reason of doing so
+    is that before the error some warnings could be received.
+    User must have a possibility to investigate the warnings.
 
     @param[out] out_error  in case of error, the method is going to return error
                            code and description
 
     @return Object responsible for fetching "resultset/s" from the server
-      @retval != nullptr  OK
-      @retval == nullptr  error occurred
+      @retval != nullptr  always valid object
   */
   virtual std::unique_ptr<XQuery_result> recv_resultset(XError *out_error) = 0;
 
@@ -766,4 +767,4 @@ class XProtocol {
 
 }  // namespace xcl
 
-#endif  // X_CLIENT_MYSQLXCLIENT_XPROTOCOL_H_
+#endif  // PLUGIN_X_CLIENT_MYSQLXCLIENT_XPROTOCOL_H_

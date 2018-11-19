@@ -45,8 +45,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "fts0priv.h"
 #include "fts0types.h"
 #include "ha_prototypes.h"
-#include "my_compiler.h"
-#include "my_inttypes.h"
 #include "os0thread-create.h"
 #include "que0types.h"
 #include "row0sel.h"
@@ -643,7 +641,7 @@ static ibool fts_fetch_index_words(
   fts_zip_t *zip = static_cast<fts_zip_t *>(user_arg);
   que_node_t *exp = sel_node->select_list;
   dfield_t *dfield = que_node_get_val(exp);
-  short len = static_cast<short>(dfield_get_len(dfield));
+  ushort len = static_cast<ushort>(dfield_get_len(dfield));
   void *data = dfield_get_data(dfield);
 
   /* Skip the duplicate words. */

@@ -1,4 +1,4 @@
-/* Copyright (c) 2004, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2004, 2018, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -1340,8 +1340,9 @@ bool ha_federated::create_where_from_key(String *to, KEY *key_info,
                                       part_length)) {
               goto err;
             }
+            break;
           }
-          break;
+          // Fall through.
         case HA_READ_KEY_OR_NEXT:
           DBUG_PRINT("info", ("federated HA_READ_KEY_OR_NEXT %d", i));
           if (emit_key_part_name(&tmp, key_part) ||
@@ -1358,8 +1359,9 @@ bool ha_federated::create_where_from_key(String *to, KEY *key_info,
                 emit_key_part_element(&tmp, key_part, needs_quotes, 0, ptr,
                                       part_length))
               goto err;
+            break;
           }
-          break;
+          // Fall through.
         case HA_READ_KEY_OR_PREV:
           DBUG_PRINT("info", ("federated HA_READ_KEY_OR_PREV %d", i));
           if (emit_key_part_name(&tmp, key_part) ||
@@ -2962,6 +2964,9 @@ int ha_federated::stash_remote_error() {
   strmake(remote_error_buf, mysql_error(mysql), sizeof(remote_error_buf) - 1);
   if (remote_error_number == ER_DUP_ENTRY || remote_error_number == ER_DUP_KEY)
     DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
+  if (remote_error_number == ER_NO_REFERENCED_ROW ||
+      remote_error_number == ER_NO_REFERENCED_ROW_2)
+    DBUG_RETURN(HA_ERR_NO_REFERENCED_ROW);
   DBUG_RETURN(HA_FEDERATED_ERROR_WITH_REMOTE_SYSTEM);
 }
 

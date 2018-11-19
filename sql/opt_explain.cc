@@ -842,7 +842,8 @@ bool Explain_table_base::explain_possible_keys() {
 bool Explain_table_base::explain_key_parts(int key, uint key_parts) {
   KEY_PART_INFO *kp = table->key_info[key].key_part;
   for (uint i = 0; i < key_parts; i++, kp++)
-    if (fmt->entry()->col_key_parts.push_back(kp->field->field_name))
+    if (fmt->entry()->col_key_parts.push_back(
+            get_field_name_or_expression(table->in_use, kp->field)))
       return true;
   return false;
 }
@@ -1275,6 +1276,7 @@ bool Explain_join::explain_qep_tab(size_t tabnum) {
   if (!tab->position()) return false;
   table = tab->table();
   usable_keys = tab->keys();
+  usable_keys.merge(table->possible_quick_keys);
   quick_type = -1;
 
   if (tab->type() == JT_RANGE || tab->type() == JT_INDEX_MERGE) {
@@ -1426,15 +1428,6 @@ bool Explain_join::explain_ref() {
   return explain_ref_key(fmt, tab->ref().key_parts, tab->ref().key_copy);
 }
 
-static void human_readable_size(char *buf, int buf_len, double data_size) {
-  char size[] = " KMGTP";
-  int i;
-  for (i = 0; data_size > 1024 && i < 5; i++) data_size /= 1024;
-  const char mult = i == 0 ? 0 : size[i];
-  snprintf(buf, buf_len, "%llu%c", (ulonglong)data_size, mult);
-  buf[buf_len - 1] = 0;
-}
-
 bool Explain_join::explain_rows_and_filtered() {
   if (!tab || tab->table_ref->schema_table) return false;
 
@@ -1456,7 +1449,11 @@ bool Explain_join::explain_rows_and_filtered() {
 
     // Print cost-related info
     double prefix_rows = pos->prefix_rowcount;
-    fmt->entry()->col_prefix_rows.set(static_cast<ulonglong>(prefix_rows));
+    ulonglong prefix_rows_ull =
+        prefix_rows >= std::numeric_limits<ulonglong>::max()
+            ? std::numeric_limits<ulonglong>::max()
+            : static_cast<ulonglong>(prefix_rows);
+    fmt->entry()->col_prefix_rows.set(prefix_rows_ull);
     double const cond_cost = join->cost_model()->row_evaluate_cost(prefix_rows);
     fmt->entry()->col_cond_cost.set(cond_cost < 0 ? 0 : cond_cost);
     fmt->entry()->col_read_cost.set(pos->read_cost < 0.0 ? 0.0
@@ -1465,7 +1462,7 @@ bool Explain_join::explain_rows_and_filtered() {
     // Calculate amount of data from this table per query
     char data_size_str[32];
     double data_size = prefix_rows * tab->table()->s->rec_buff_length;
-    human_readable_size(data_size_str, sizeof(data_size_str), data_size);
+    human_readable_num_bytes(data_size_str, sizeof(data_size_str), data_size);
     fmt->entry()->col_data_size_query.set(data_size_str);
   }
 
@@ -1533,6 +1530,8 @@ bool Explain_join::explain_extra() {
         StringBuffer<64> buff(cs);
         qgs->append_loose_scan_type(&buff);
         if (push_extra(ET_USING_INDEX_FOR_GROUP_BY, buff)) return true;
+      } else if (quick_type == QUICK_SELECT_I::QS_TYPE_SKIP_SCAN) {
+        if (push_extra(ET_USING_INDEX_FOR_SKIP_SCAN)) return true;
       } else {
         if (push_extra(ET_USING_INDEX)) return true;
       }
@@ -1601,9 +1600,12 @@ bool Explain_join::explain_extra() {
       if (!bitmap_is_set(table->read_set, (*fld)->field_index) &&
           !bitmap_is_set(table->write_set, (*fld)->field_index))
         continue;
-      fmt->entry()->col_used_columns.push_back((*fld)->field_name);
+
+      const char *field_description =
+          get_field_name_or_expression(table->in_use, *fld);
+      fmt->entry()->col_used_columns.push_back(field_description);
       if (table->is_binary_diff_enabled(*fld))
-        fmt->entry()->col_partial_update_columns.push_back((*fld)->field_name);
+        fmt->entry()->col_partial_update_columns.push_back(field_description);
     }
   }
   return false;
@@ -1869,8 +1871,18 @@ bool explain_single_table_modification(THD *ethd, const Modification_plan *plan,
   }
   if (ret)
     result.abort_result_set();
-  else
+  else {
+    if (!other) {
+      StringBuffer<1024> str;
+      query_thd->lex->unit->print(
+          &str, enum_query_type(QT_TO_SYSTEM_CHARSET | QT_SHOW_SELECT_NUMBER |
+                                QT_NO_DATA_EXPANSION));
+      str.append('\0');
+      push_warning(ethd, Sql_condition::SL_NOTE, ER_YES, str.ptr());
+    }
+
     result.send_eof();
+  }
   DBUG_RETURN(ret);
 }
 
@@ -2031,18 +2043,35 @@ bool explain_query(THD *ethd, SELECT_LEX_UNIT *unit) {
        against malformed queries, so skip it if we have an error.
     2) The code also isn't thread-safe, skip if explaining other thread
     (see Explain::can_print_clauses())
-    3) Currently only SELECT queries can be printed (TODO: fix this)
+    3) Allow only SELECT, INSERT/REPLACE ... SELECT, Multi-DELETE and
+       Multi-UPDATE. Also Update of VIEW (so techincally it is a single table
+       UPDATE), but if the VIEW refers to multiple tables it will be handled in
+       this function.
   */
-  if (!res &&                                                // (1)
-      !other &&                                              // (2)
-      query_thd->query_plan.get_command() == SQLCOM_SELECT)  // (3)
+  if (!res &&    // (1)
+      !other &&  // (2)
+      (query_thd->query_plan.get_command() == SQLCOM_SELECT ||
+       query_thd->query_plan.get_command() == SQLCOM_INSERT_SELECT ||
+       query_thd->query_plan.get_command() == SQLCOM_REPLACE_SELECT ||
+       query_thd->query_plan.get_command() == SQLCOM_DELETE_MULTI ||
+       query_thd->query_plan.get_command() == SQLCOM_UPDATE ||
+       query_thd->query_plan.get_command() == SQLCOM_UPDATE_MULTI))  // (3)
   {
     StringBuffer<1024> str;
     /*
       The warnings system requires input in utf8, see mysqld_show_warnings().
     */
-    unit->print(&str,
-                enum_query_type(QT_TO_SYSTEM_CHARSET | QT_SHOW_SELECT_NUMBER));
+
+    enum_query_type eqt =
+        enum_query_type(QT_TO_SYSTEM_CHARSET | QT_SHOW_SELECT_NUMBER);
+
+    /**
+      For DML statements use QT_NO_DATA_EXPANSION to avoid over-simplification.
+    */
+    if (query_thd->query_plan.get_command() != SQLCOM_SELECT)
+      eqt = enum_query_type(eqt | QT_NO_DATA_EXPANSION);
+
+    unit->print(&str, eqt);
     str.append('\0');
     push_warning(ethd, Sql_condition::SL_NOTE, ER_YES, str.ptr());
   }

@@ -40,7 +40,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ibuf0ibuf.h"
 #include "log0log.h"
 #include "mach0data.h"
-#include "my_inttypes.h"
 #include "que0que.h"
 #include "row0log.h"
 #include "row0row.h"
@@ -296,11 +295,12 @@ static void row_undo_ins_parse_undo_rec(undo_node_t *node, MDL_ticket **mdl) {
   ulint type;
   ulint dummy;
   bool dummy_extern;
+  type_cmpl_t type_cmpl;
 
   ut_ad(node);
 
   ptr = trx_undo_rec_get_pars(node->undo_rec, &type, &dummy, &dummy_extern,
-                              &undo_no, &table_id);
+                              &undo_no, &table_id, type_cmpl);
   ut_ad(type == TRX_UNDO_INSERT_REC);
   node->rec_type = type;
 

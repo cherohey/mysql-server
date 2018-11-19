@@ -317,9 +317,19 @@ static void do_copy_next_number(Copy_field *copy) {
 }
 
 static void do_copy_blob(Copy_field *copy) {
-  ulong length = ((Field_blob *)copy->from_field())->get_length();
-  ((Field_blob *)copy->to_field())->store_length(length);
+  ulong from_length = ((Field_blob *)copy->from_field())->get_length();
+  ((Field_blob *)copy->to_field())->store_length(from_length);
   memcpy(copy->to_ptr, copy->from_ptr, sizeof(char *));
+  ulong to_length = ((Field_blob *)copy->to_field())->get_length();
+  if (to_length < from_length) {
+    if (copy->to_field()->table->in_use->is_strict_mode()) {
+      copy->to_field()->set_warning(Sql_condition::SL_WARNING, ER_DATA_TOO_LONG,
+                                    1);
+    } else {
+      copy->to_field()->set_warning(Sql_condition::SL_WARNING,
+                                    WARN_DATA_TRUNCATED, 1);
+    }
+  }
 }
 
 static void do_conv_blob(Copy_field *copy) {
@@ -842,7 +852,7 @@ type_conversion_status field_conv(Field *to, Field *from) {
 
   if (to->real_type() == from->real_type() &&
       !((is_blob_type(to)) && to->table->copy_blobs) &&
-      to->charset() == from->charset()) {
+      to->charset() == from->charset() && to_type != MYSQL_TYPE_GEOMETRY) {
     if (to->real_type() == MYSQL_TYPE_VARCHAR &&
         from->real_type() == MYSQL_TYPE_VARCHAR) {
       Field_varstring *to_vc = static_cast<Field_varstring *>(to);

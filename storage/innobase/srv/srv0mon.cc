@@ -38,7 +38,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ibuf0ibuf.h"
 #include "lock0lock.h"
 #include "mach0data.h"
-#include "my_inttypes.h"
 #include "os0file.h"
 #include "srv0mon.h"
 #include "srv0srv.h"
@@ -811,10 +810,20 @@ static monitor_info_t innodb_counter_info[] = {
      static_cast<monitor_type_t>(MONITOR_EXISTING | MONITOR_DISPLAY_CURRENT),
      MONITOR_DEFAULT_START, MONITOR_OVLD_LSN_CHECKPOINT_AGE},
 
-    {"log_lsn_buf_pool_oldest", "log",
-     "The oldest modified block LSN in the buffer pool",
+    {"log_lsn_buf_dirty_pages_added", "log",
+     "The LSN value up to which all dirty pages have been added",
+     static_cast<monitor_type_t>(MONITOR_EXISTING | MONITOR_DISPLAY_CURRENT),
+     MONITOR_DEFAULT_START, MONITOR_OVLD_LSN_BUF_DIRTY_PAGES_ADDED},
+
+    {"log_lsn_buf_pool_oldest_approx", "log",
+     "Approximation for the oldest modified block LSN in the buffer pool",
      static_cast<monitor_type_t>(MONITOR_EXISTING | MONITOR_DISPLAY_CURRENT),
      MONITOR_DEFAULT_START, MONITOR_OVLD_BUF_OLDEST_LSN_APPROX},
+
+    {"log_lsn_buf_pool_oldest_lwm", "log",
+     "Low watermark for the oldest modified block LSN in the buffer pool",
+     static_cast<monitor_type_t>(MONITOR_EXISTING | MONITOR_DISPLAY_CURRENT),
+     MONITOR_DEFAULT_START, MONITOR_OVLD_BUF_OLDEST_LSN_LWM},
 
     {"log_max_modified_age_async", "log",
      "Maximum LSN difference; when exceeded, start asynchronous preflush",
@@ -873,9 +882,24 @@ static monitor_info_t innodb_counter_info[] = {
     {"log_checkpoints", "log", "Number of checkpoints", MONITOR_NONE,
      MONITOR_DEFAULT_START, MONITOR_LOG_CHECKPOINTS},
 
+    {"log_free_space", "log", "Free space in redo (emergency when negative).",
+     MONITOR_NONE, MONITOR_DEFAULT_START, MONITOR_LOG_FREE_SPACE},
+
+    {"log_concurrency_margin", "log",
+     "Current concurrency margin used (may increase).", MONITOR_NONE,
+     MONITOR_DEFAULT_START, MONITOR_LOG_CONCURRENCY_MARGIN},
+
     MONITOR_WAIT_STATS("log_writer_", "log",
                        "Waits on task in log_writer thread",
                        MONITOR_LOG_WRITER_),
+
+    {"log_writer_on_file_space_waits", "log",
+     "Waits on free space in log writer", MONITOR_NONE, MONITOR_DEFAULT_START,
+     MONITOR_LOG_WRITER_ON_FREE_SPACE_WAITS},
+
+    {"log_writer_on_archiver_waits", "log",
+     "Waits on redo archiver in log writer", MONITOR_NONE,
+     MONITOR_DEFAULT_START, MONITOR_LOG_WRITER_ON_ARCHIVER_WAITS},
 
     MONITOR_WAIT_STATS("log_flusher_", "log",
                        "Waits on task in log_flusher thread",
@@ -1786,8 +1810,16 @@ void srv_mon_process_existing_counter(
       value = (mon_type_t)log_get_lsn(*log_sys);
       break;
 
+    case MONITOR_OVLD_LSN_BUF_DIRTY_PAGES_ADDED:
+      value = (mon_type_t)log_buffer_dirty_pages_added_up_to_lsn(*log_sys);
+      break;
+
     case MONITOR_OVLD_BUF_OLDEST_LSN_APPROX:
       value = (mon_type_t)buf_pool_get_oldest_modification_approx();
+      break;
+
+    case MONITOR_OVLD_BUF_OLDEST_LSN_LWM:
+      value = (mon_type_t)buf_pool_get_oldest_modification_lwm();
       break;
 
     case MONITOR_OVLD_LSN_CHECKPOINT:

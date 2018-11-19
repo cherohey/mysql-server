@@ -273,6 +273,10 @@ bool grant_grant_option_for_all_dynamic_privileges(
 bool revoke_grant_option_for_all_dynamic_privileges(
     const LEX_CSTRING &str_user, const LEX_CSTRING &str_host,
     Update_dynamic_privilege_table &func);
+bool grant_dynamic_privileges_to_auth_id(
+    const Role_id &id, const std::vector<std::string> &priv_list);
+void revoke_dynamic_privileges_from_auth_id(
+    const Role_id &id, const std::vector<std::string> &priv_list);
 bool operator==(const Role_id &a, const Auth_id_ref &b);
 bool operator==(const Auth_id_ref &a, const Role_id &b);
 bool operator==(const std::pair<const Role_id, const Role_id> &a,
@@ -328,7 +332,7 @@ bool roles_rename_authid(THD *thd, TABLE *edge_table, TABLE *defaults_table,
 bool set_and_validate_user_attributes(THD *thd, LEX_USER *Str,
                                       ulong &what_to_set,
                                       bool is_privileged_user, bool is_role,
-                                      TABLE_LIST *history_table,
+                                      TABLE_LIST *table_list,
                                       bool *history_check_done,
                                       const char *cmd);
 typedef std::pair<std::string, bool> Grant_privilege;
@@ -351,4 +355,5 @@ bool alter_user_set_default_roles(THD *thd, TABLE *table, LEX_USER *user,
 
 bool alter_user_set_default_roles_all(THD *thd, TABLE *def_role_table,
                                       LEX_USER *user);
+
 #endif /* AUTH_INTERNAL_INCLUDED */

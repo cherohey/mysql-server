@@ -230,29 +230,8 @@ will use only the largest power of two, which is not greater than
 the assigned space. */
 ulong srv_log_buffer_size;
 
-/** When log writer follows links in the log recent written buffer,
-it stops when it has reached at least that many bytes to write,
-limiting how many bytes can be written in single call. */
-ulong srv_log_write_max_size;
-
 /** Size of block, used for writing ahead to avoid read-on-write. */
 ulong srv_log_write_ahead_size;
-
-/** Number of events used for notifications about redo write. */
-ulong srv_log_write_events;
-
-/** Number of events used for notifications about redo flush. */
-ulong srv_log_flush_events;
-
-/** Number of slots in a small buffer, which is used to allow concurrent
-writes to log buffer. The slots are addressed by LSN values modulo number
-of the slots. */
-ulong srv_log_recent_written_size;
-
-/** Number of slots in a small buffer, which is used to break requirement
-for total order of dirty pages, when they are added to flush lists.
-The slots are addressed by LSN values modulo number of the slots. */
-ulong srv_log_recent_closed_size;
 
 /** Minimum absolute value of cpu time for which spin-delay is used. */
 uint srv_log_spin_cpu_abs_lwm;
@@ -260,64 +239,97 @@ uint srv_log_spin_cpu_abs_lwm;
 /** Maximum percentage of cpu time for which spin-delay is used. */
 uint srv_log_spin_cpu_pct_hwm;
 
-/** Number of spin iterations, when spinning and waiting for log buffer
-written up to given LSN, before we fallback to loop with sleeps.
-This is not used when user thread has to wait for log flushed to disk. */
-ulong srv_log_wait_for_write_spin_delay;
-
-/** Timeout used when waiting for redo write (microseconds). */
-ulong srv_log_wait_for_write_timeout;
-
-/** Number of spin iterations, when spinning and waiting for log flushed. */
-ulong srv_log_wait_for_flush_spin_delay;
-
 /** Maximum value of average log flush time for which spin-delay is used.
 When flushing takes longer, user threads no longer spin when waiting for
 flushed redo. Expressed in microseconds. */
 ulong srv_log_wait_for_flush_spin_hwm;
 
+/* EXPERIMENTAL sys vars below - we need defaults set explicitly here. */
+
+/** When log writer follows links in the log recent written buffer,
+it stops when it has reached at least that many bytes to write,
+limiting how many bytes can be written in single call. */
+ulong srv_log_write_max_size = INNODB_LOG_WRITE_MAX_SIZE_DEFAULT;
+
+/** Number of events used for notifications about redo write. */
+ulong srv_log_write_events = INNODB_LOG_EVENTS_DEFAULT;
+
+/** Number of events used for notifications about redo flush. */
+ulong srv_log_flush_events = INNODB_LOG_EVENTS_DEFAULT;
+
+/** Number of slots in a small buffer, which is used to allow concurrent
+writes to log buffer. The slots are addressed by LSN values modulo number
+of the slots. */
+ulong srv_log_recent_written_size = INNODB_LOG_RECENT_WRITTEN_SIZE_DEFAULT;
+
+/** Number of slots in a small buffer, which is used to break requirement
+for total order of dirty pages, when they are added to flush lists.
+The slots are addressed by LSN values modulo number of the slots. */
+ulong srv_log_recent_closed_size = INNODB_LOG_RECENT_CLOSED_SIZE_DEFAULT;
+
+/** Number of spin iterations, when spinning and waiting for log buffer
+written up to given LSN, before we fallback to loop with sleeps.
+This is not used when user thread has to wait for log flushed to disk. */
+ulong srv_log_wait_for_write_spin_delay =
+    INNODB_LOG_WAIT_FOR_WRITE_SPIN_DELAY_DEFAULT;
+
+/** Timeout used when waiting for redo write (microseconds). */
+ulong srv_log_wait_for_write_timeout =
+    INNODB_LOG_WAIT_FOR_WRITE_TIMEOUT_DEFAULT;
+
+/** Number of spin iterations, when spinning and waiting for log flushed. */
+ulong srv_log_wait_for_flush_spin_delay =
+    INNODB_LOG_WAIT_FOR_FLUSH_SPIN_DELAY_DEFAULT;
+
 /** Timeout used when waiting for redo flush (microseconds). */
-ulong srv_log_wait_for_flush_timeout;
+ulong srv_log_wait_for_flush_timeout =
+    INNODB_LOG_WAIT_FOR_FLUSH_TIMEOUT_DEFAULT;
 
 /** Number of spin iterations, for which log writer thread is waiting
 for new data to write or flush without sleeping. */
-ulong srv_log_writer_spin_delay;
+ulong srv_log_writer_spin_delay = INNODB_LOG_WRITER_SPIN_DELAY_DEFAULT;
 
 /** Initial timeout used to wait on writer_event. */
-ulong srv_log_writer_timeout;
+ulong srv_log_writer_timeout = INNODB_LOG_WRITER_TIMEOUT_DEFAULT;
 
 /** Number of milliseconds every which a periodical checkpoint is written
 by the log checkpointer thread (unless periodical checkpoints are disabled,
 which is a case during initial phase of startup). */
-ulong srv_log_checkpoint_every;
+ulong srv_log_checkpoint_every = INNODB_LOG_CHECKPOINT_EVERY_DEFAULT;
 
 /** Number of spin iterations, for which log flusher thread is waiting
 for new data to flush, without sleeping. */
-ulong srv_log_flusher_spin_delay;
+ulong srv_log_flusher_spin_delay = INNODB_LOG_FLUSHER_SPIN_DELAY_DEFAULT;
 
 /** Initial timeout used to wait on flusher_event. */
-ulong srv_log_flusher_timeout;
+ulong srv_log_flusher_timeout = INNODB_LOG_FLUSHER_TIMEOUT_DEFAULT;
 
 /** Number of spin iterations, for which log write notifier thread is waiting
 for advanced flushed_to_disk_lsn without sleeping. */
-ulong srv_log_write_notifier_spin_delay;
+ulong srv_log_write_notifier_spin_delay =
+    INNODB_LOG_WRITE_NOTIFIER_SPIN_DELAY_DEFAULT;
 
 /** Initial timeout used to wait on write_notifier_event. */
-ulong srv_log_write_notifier_timeout;
+ulong srv_log_write_notifier_timeout =
+    INNODB_LOG_WRITE_NOTIFIER_TIMEOUT_DEFAULT;
 
 /** Number of spin iterations, for which log flush notifier thread is waiting
 for advanced flushed_to_disk_lsn without sleeping. */
-ulong srv_log_flush_notifier_spin_delay;
+ulong srv_log_flush_notifier_spin_delay =
+    INNODB_LOG_FLUSH_NOTIFIER_SPIN_DELAY_DEFAULT;
 
 /** Initial timeout used to wait on flush_notifier_event. */
-ulong srv_log_flush_notifier_timeout;
+ulong srv_log_flush_notifier_timeout =
+    INNODB_LOG_FLUSH_NOTIFIER_TIMEOUT_DEFAULT;
 
 /** Number of spin iterations, for which log closerr thread is waiting
 for a reachable untraversed link in recent_closed. */
-ulong srv_log_closer_spin_delay;
+ulong srv_log_closer_spin_delay = INNODB_LOG_CLOSER_SPIN_DELAY_DEFAULT;
 
 /** Initial sleep used in log closer after spin delay is finished. */
-ulong srv_log_closer_timeout;
+ulong srv_log_closer_timeout = INNODB_LOG_CLOSER_TIMEOUT_DEFAULT;
+
+/* End of EXPERIMENTAL sys vars */
 
 /** Whether to generate and require checksums on the redo log pages. */
 bool srv_log_checksums;
@@ -362,7 +374,7 @@ const ulint srv_buf_pool_min_size = 5 * 1024 * 1024;
 const ulint srv_buf_pool_def_size = 128 * 1024 * 1024;
 /** Requested buffer pool chunk size. Each buffer pool instance consists
 of one or more chunks. */
-ulong srv_buf_pool_chunk_unit;
+ulonglong srv_buf_pool_chunk_unit;
 /** Requested number of buffer pool instances */
 ulong srv_buf_pool_instances;
 /** Default number of buffer pool instances */
@@ -761,6 +773,12 @@ PSI_stage_info srv_stage_alter_table_read_pk_internal_sort = {
     0, "alter table (read PK and internal sort)", PSI_FLAG_STAGE_PROGRESS,
     PSI_DOCUMENT_ME};
 
+/** Performance schema stage event for monitoring ALTER TABLESPACE
+ENCRYPTION progress. */
+PSI_stage_info srv_stage_alter_tablespace_encryption = {
+    0, "alter tablespace (encryption)", PSI_FLAG_STAGE_PROGRESS,
+    PSI_DOCUMENT_ME};
+
 /** Performance schema stage event for monitoring buffer pool load progress. */
 PSI_stage_info srv_stage_buffer_pool_load = {
     0, "buffer pool load", PSI_FLAG_STAGE_PROGRESS, PSI_DOCUMENT_ME};
@@ -824,7 +842,6 @@ static ibool srv_thread_type_validate(
       return (TRUE);
   }
   ut_error;
-  return (FALSE);
 }
 #endif /* UNIV_DEBUG */
 
@@ -1718,6 +1735,7 @@ shutdown has already been completed.
 const char *srv_any_background_threads_are_active() {
   const char *thread_active = NULL;
 
+  ut_ad(!srv_threads.m_ts_alter_encrypt_thread_active);
   ut_ad(!srv_threads.m_dict_stats_thread_active);
 
   if (srv_read_only_mode) {
@@ -1761,6 +1779,7 @@ bool srv_master_thread_active() {
   }
 
   ut_a(!srv_threads.m_dict_stats_thread_active);
+  ut_a(!srv_threads.m_ts_alter_encrypt_thread_active);
   srv_sys_mutex_enter();
   ut_a(srv_sys->n_threads_active[SRV_WORKER] == 0);
   ut_a(srv_sys->n_threads_active[SRV_PURGE] == 0);
@@ -2391,7 +2410,7 @@ static void srv_enable_undo_encryption_if_set() {
         return;
       } else {
         if (!fsp_header_write_encryption(space->id, new_flags, encrypt_info,
-                                         true, &mtr)) {
+                                         true, false, &mtr)) {
           srv_undo_log_encrypt = false;
 
           ib::error(ER_IB_MSG_1053);

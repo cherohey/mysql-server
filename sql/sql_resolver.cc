@@ -380,9 +380,24 @@ bool SELECT_LEX::prepare(THD *thd) {
     if (resolve_subquery(thd)) DBUG_RETURN(true);
   }
 
-  if (m_having_cond && m_having_cond->has_aggregation())
+  /*
+    If GROUPING function is present in having condition -
+    1. Set that the evaluation of this condition depends on rollup
+    result.
+    2. Add a reference to the condition so that result is stored
+    after evalution.
+  */
+  bool has_grouping_func =
+      m_having_cond ? m_having_cond->walk(&Item::has_grouping_func_processor,
+                                          Item::WALK_POSTFIX, NULL)
+                    : false;
+  if (has_grouping_func) m_having_cond->set_has_rollup_field();
+
+  if (m_having_cond &&
+      (m_having_cond->has_aggregation() || has_grouping_func)) {
     m_having_cond->split_sum_func2(thd, base_ref_items, all_fields,
                                    &m_having_cond, true);
+  }
   if (inner_sum_func_list) {
     Item_sum *end = inner_sum_func_list;
     Item_sum *item_sum = end;
@@ -3362,30 +3377,22 @@ bool SELECT_LEX::setup_group(THD *thd) {
   DBUG_ASSERT(group_list.elements);
 
   thd->where = "group statement";
-  int has_explicit = 0;
   for (ORDER *group = group_list.first; group; group = group->next) {
     if (find_order_in_list(thd, base_ref_items, get_table_list(), group,
                            fields_list, all_fields, true))
       DBUG_RETURN(true);
 
     Item *item = *group->item;
-    if (item->has_aggregation() || (item->type() == Item::FUNC_ITEM &&
-                                    (down_cast<Item_func *>(item)->functype() ==
-                                     Item_func::GROUPING_FUNC))) {
+    if (item->has_aggregation() || item->has_wf()) {
       my_error(ER_WRONG_GROUP_FIELD, MYF(0), (*group->item)->full_name());
       DBUG_RETURN(true);
     }
 
-    if ((*group->item)->has_wf()) {
-      my_error(ER_WRONG_GROUP_FIELD, MYF(0), (*group->item)->full_name());
+    else if (item->walk(&Item::has_grouping_func_processor, Item::WALK_POSTFIX,
+                        NULL)) {
+      my_error(ER_WRONG_GROUP_FIELD, MYF(0), "GROUPING function");
       DBUG_RETURN(true);
     }
-
-    has_explicit += group->is_explicit;
-  }
-  if (has_explicit && m_windows.elements > 0) {
-    my_error(ER_WINDOW_NO_GROUP_ORDER, MYF(0));
-    DBUG_RETURN(true);
   }
   DBUG_RETURN(false);
 }
@@ -3544,11 +3551,9 @@ bool SELECT_LEX::resolve_rollup(THD *thd) {
       if (change_func_or_wf_group_ref(thd, item, &changed))
         DBUG_RETURN(true); /* purecov: inspected */
       /*
-        We have to prevent creation of a field in a temporary table for
-        an expression that contains GROUP BY attributes.
-        Marking the expression item as 'aggregated' will ensure this.
+        Mark this item has having a rollup field.
       */
-      if (changed) item->set_aggregation();
+      if (changed) item->set_has_rollup_field();
     }
     if (item->type() == Item::SUM_FUNC_ITEM && item->m_is_window_function) {
       bool changed = false;
@@ -3598,6 +3603,24 @@ bool validate_gc_assignment(List<Item> *fields, List<Item> *values,
     else
       rfield = *(fld++);
     if (rfield->table != table) continue;
+
+    // Skip fields that are hidden from the user.
+    if (rfield->is_hidden_from_user()) continue;
+
+    // If any of the explicit values is DEFAULT
+    if (rfield->m_default_val_expr &&
+        value->type() == Item::DEFAULT_VALUE_ITEM) {
+      // Restore the statement safety flag to current lex
+      table->in_use->lex->set_stmt_unsafe_flags(
+          rfield->m_default_val_expr->get_stmt_unsafe_flags());
+      // Mark the columns that this expression reads to rthe ead_set
+      for (uint j = 0; j < table->s->fields; j++) {
+        if (bitmap_is_set(&rfield->m_default_val_expr->base_columns_map, j)) {
+          bitmap_set_bit(table->read_set, j);
+        }
+      }
+    }
+
     /* skip non marked fields */
     if (!bitmap_is_set(bitmap, rfield->field_index)) continue;
     if (rfield->gcol_info && value->type() != Item::DEFAULT_VALUE_ITEM) {

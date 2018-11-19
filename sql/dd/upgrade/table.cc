@@ -105,6 +105,35 @@ class Table;
 }  // namespace dd
 
 namespace dd {
+namespace bootstrap {
+
+/**
+  Validate all the triggers of the given table.
+*/
+bool invalid_triggers(THD *thd, const char *schema_name,
+                      const dd::Table &table) {
+  if (!table.has_trigger()) return false;
+  List<::Trigger> triggers;
+  if (dd::load_triggers(thd, thd->mem_root, schema_name, table.name().c_str(),
+                        table, &triggers))
+    return true;
+  for (::Trigger &t : triggers) {
+    if (t.parse(thd, false) || t.has_parse_error()) {
+      LogEvent()
+          .type(LOG_TYPE_ERROR)
+          .subsys(LOG_SUBSYSTEM_TAG)
+          .prio(ERROR_LEVEL)
+          .errcode(ER_UPGRADE_PARSE_ERROR)
+          .verbatim(t.get_parse_error_message());
+      thd->clear_error();
+    }
+    sp_head::destroy(t.get_sp());
+    if (upgrade_57::Syntax_error_handler::has_too_many_errors()) return true;
+  }
+  return upgrade_57::Syntax_error_handler::has_errors();
+}
+}  // namespace bootstrap
+
 namespace upgrade_57 {
 
 /*
@@ -781,7 +810,6 @@ static void create_alter_view_stmt(THD *thd, TABLE_LIST *view_ref, String *str,
   @param[in] view_ref                TABLE_LIST with view data.
   @param[in] db_name                 database name.
   @param[in] view_name               view name.
-  @param[in] mem_root                MEM_ROOT to handle memory allocations.
 
   @retval false  ON SUCCESS
   @retval true   ON FAILURE
@@ -847,6 +875,9 @@ static bool fix_view_cols_and_deps(THD *thd, TABLE_LIST *view_ref,
         LogErr(ERROR_LEVEL, ER_DD_UPGRADE_VIEW_COLUMN_NAME_TOO_LONG,
                db_name.c_str(), view_name.c_str());
         error = true;
+      } else if (Syntax_error_handler::is_parse_error) {
+        LogErr(ERROR_LEVEL, ER_UPGRADE_PARSE_ERROR, "View", db_name.c_str(),
+               view_name.c_str(), Syntax_error_handler::error_message());
       } else {
         LogErr(WARNING_LEVEL, ER_DD_CANT_RESOLVE_VIEW, db_name.c_str(),
                view_name.c_str());
@@ -1018,10 +1049,26 @@ static bool fill_partition_info_for_upgrade(THD *thd, TABLE_SHARE *share,
   return false;
 }
 
+static bool invalid_triggers(Table_trigger_dispatcher *d,
+                             List<::Trigger> &triggers) {
+  if (!d->check_for_broken_triggers()) return false;
+  for (::Trigger &t : triggers) {
+    if (t.has_parse_error()) {
+      LogEvent()
+          .type(LOG_TYPE_ERROR)
+          .subsys(LOG_SUBSYSTEM_TAG)
+          .prio(ERROR_LEVEL)
+          .errcode(ER_UPGRADE_PARSE_ERROR)
+          .verbatim(t.get_parse_error_message());
+    }
+    sp_head::destroy(t.get_sp());
+  }
+  return true;
+}
+
 /**
   Add triggers to table
 */
-
 static bool add_triggers_to_table(THD *thd, TABLE *table,
                                   const String_type &schema_name,
                                   const String_type &table_name) {
@@ -1035,11 +1082,14 @@ static bool add_triggers_to_table(THD *thd, TABLE *table,
     }
     Table_trigger_dispatcher *d = Table_trigger_dispatcher::create(table);
 
+    Bootstrap_error_handler error_handler;
+    error_handler.set_log_error(false);
     d->parse_triggers(thd, &m_triggers, true);
-    if (d->check_for_broken_triggers()) {
-      LogErr(WARNING_LEVEL, ER_TRG_CANT_PARSE, table_name.c_str());
+    if (invalid_triggers(d, m_triggers)) {
+      LogErr(ERROR_LEVEL, ER_TRG_CANT_PARSE, table_name.c_str());
       return true;
     }
+    error_handler.set_log_error(true);
 
     List_iterator<::Trigger> it(m_triggers);
     /*
@@ -1163,7 +1213,9 @@ static bool fix_generated_columns_for_upgrade(
     for (field_ptr = table->s->field; (sql_field = itc++); field_ptr++) {
       // Field has generated col information.
       if (sql_field->gcol_info && (*field_ptr)->gcol_info) {
-        if (unpack_gcol_info(thd, table, *field_ptr, false, &error_reported)) {
+        if (unpack_value_generator(thd, table, *field_ptr,
+                                   &(*field_ptr)->gcol_info, false, true,
+                                   &error_reported)) {
           error = true;
           break;
         }
@@ -1305,10 +1357,10 @@ static bool fix_fk_parent_key_names(THD *thd, const String_type &schema_name,
         is upgraded.
       */
     } else {
-      const char *parent_key_name = find_fk_parent_key(parent_table_def, fk);
-      // Note: If the key returned above is "", this is interpreted as NULL
-      // when storing the value to the DD tables.
-      fk->set_unique_constraint_name(parent_key_name);
+      bool is_self_referencing_fk = (parent_table_def == table_def);
+      if (prepare_fk_parent_key(hton, parent_table_def, nullptr, nullptr,
+                                is_self_referencing_fk, fk))
+        return true;
     }
   }
 
@@ -1502,14 +1554,13 @@ static bool migrate_table_to_dd(THD *thd, const String_type &schema_name,
 
   // Foreign keys are handled at later stage by retrieving info from SE.
   FOREIGN_KEY *dummy_fk_key_info = NULL;
-  uint fk_key_count = 0;
+  uint dummy_fk_key_count = 0;
 
   if (mysql_prepare_create_table(
           thd, schema_name.c_str(), table_name.c_str(), &create_info,
-          &alter_info, file, &key_info_buffer, &key_count, &dummy_fk_key_info,
-          &fk_key_count, alter_ctx.fk_info, alter_ctx.fk_count,
-          alter_ctx.fk_max_generated_name_number, 0,
-          false /* No FKs here. */)) {
+          &alter_info, file, (share.partition_info_str_len != 0),
+          &key_info_buffer, &key_count, &dummy_fk_key_info, &dummy_fk_key_count,
+          nullptr, 0, nullptr, 0, 0, false /* No FKs here. */)) {
     return true;
   }
 
@@ -1692,7 +1743,9 @@ bool migrate_all_frm_to_dd(THD *thd, const char *dbname,
     LogErr(ERROR_LEVEL, ER_CANT_OPEN_DIR, path.c_str());
     return true;
   }
-  for (i = 0; i < (uint)a->number_off_files; i++) {
+  for (i = 0; i < (uint)a->number_off_files &&
+              !Syntax_error_handler::has_too_many_errors();
+       i++) {
     String_type file;
 
     file.assign(a->dir_entry[i].name);

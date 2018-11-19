@@ -22,8 +22,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
-#ifndef X_TESTS_DRIVER_CONNECTOR_RESULT_FETCHER_H_
-#define X_TESTS_DRIVER_CONNECTOR_RESULT_FETCHER_H_
+#ifndef PLUGIN_X_TESTS_DRIVER_CONNECTOR_RESULT_FETCHER_H_
+#define PLUGIN_X_TESTS_DRIVER_CONNECTOR_RESULT_FETCHER_H_
 
 #include <memory>
 #include <string>
@@ -32,20 +32,11 @@
 
 #include "plugin/x/client/mysqlxclient/xquery_result.h"
 #include "plugin/x/client/mysqlxclient/xrow.h"
+#include "plugin/x/tests/driver/connector/warning.h"
 
 class Result_fetcher {
  public:
   using XQuery_result_ptr = std::unique_ptr<xcl::XQuery_result>;
-
-  class Warning {
-   public:
-    Warning(const std::string &text, const uint32_t code, const bool is_note)
-        : m_text(text), m_code(code), m_is_note(is_note) {}
-
-    std::string m_text;
-    uint32_t m_code;
-    bool m_is_note;
-  };
 
  public:
   explicit Result_fetcher(XQuery_result_ptr query)
@@ -115,6 +106,8 @@ class Result_fetcher {
   const std::vector<Warning> get_warnings() const {
     std::vector<Warning> result;
 
+    if (nullptr == m_query) return {};
+
     for (const auto &warning : m_query->get_warnings()) {
       result.emplace_back(
           warning.msg(), warning.code(),
@@ -135,4 +128,4 @@ std::ostream &operator<<(std::ostream &os,
 
 std::ostream &operator<<(std::ostream &os, Result_fetcher *result);
 
-#endif  // X_TESTS_DRIVER_CONNECTOR_RESULT_FETCHER_H_
+#endif  // PLUGIN_X_TESTS_DRIVER_CONNECTOR_RESULT_FETCHER_H_

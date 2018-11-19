@@ -30,11 +30,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 /* The InnoDB handler: the interface between MySQL and InnoDB. */
 
 #include <sys/types.h>
-
 #include "handler.h"
-#include "my_compiler.h"
 #include "my_dbug.h"
-#include "my_inttypes.h"
 #include "trx0trx.h"
 
 /** "GEN_CLUST_INDEX" is the name reserved for InnoDB default
@@ -107,7 +104,7 @@ class ha_innobase : public handler {
 
   uint max_supported_key_length() const;
 
-  uint max_supported_key_part_length() const;
+  uint max_supported_key_part_length(HA_CREATE_INFO *create_info) const;
 
   int open(const char *name, int, uint open_flags, const dd::Table *table_def);
 
@@ -301,8 +298,6 @@ class ha_innobase : public handler {
 
   int get_cascade_foreign_key_table_list(
       THD *thd, List<st_handler_tablename> *fk_table_list);
-
-  bool can_switch_engines();
 
   uint referenced_by_foreign_key();
 
@@ -539,11 +534,6 @@ class ha_innobase : public handler {
   doesn't give any clue that it is called at the end of a statement. */
   int end_stmt();
 
-  /** Rename tablespace file name for truncate
-  @param[in]	name	table name
-  @return 0 on success, error code on failure */
-  int truncate_rename_tablespace(const char *name);
-
   /** Implementation of prepare_inplace_alter_table()
   @tparam		Table		dd::Table or dd::Partition
   @param[in]	altered_table	TABLE object for new version of table.
@@ -718,6 +708,18 @@ bool tablespace_is_general_space(const HA_CREATE_INFO *create_info) {
        strcmp(create_info->tablespace, dict_sys_t::s_file_per_table_name)) &&
       (0 != strcmp(create_info->tablespace, dict_sys_t::s_temp_space_name)) &&
       (0 != strcmp(create_info->tablespace, dict_sys_t::s_sys_space_name)));
+}
+
+/** Check if tablespace is shared tablespace.
+@param[in]	tablespace_name	Name of the tablespace
+@return true if tablespace is a shared tablespace. */
+UNIV_INLINE
+bool is_shared_tablespace(const char *tablespace_name) {
+  if (tablespace_name != NULL && tablespace_name[0] != '\0' &&
+      (strcmp(tablespace_name, dict_sys_t::s_file_per_table_name) != 0)) {
+    return true;
+  }
+  return false;
 }
 
 /** Parse hint for table and its indexes, and update the information
@@ -952,13 +954,10 @@ class innobase_basic_ddl {
   @param[in,out]	thd		THD object
   @param[in]	name		table name
   @param[in]	dd_tab		dd::Table describing table to be dropped
-  @param[in]	sqlcom		type of operation that the DROP
-                                  is part of
   @return	error number
   @retval	0 on success */
   template <typename Table>
-  static int delete_impl(THD *thd, const char *name, const Table *dd_tab,
-                         enum enum_sql_command sqlcom);
+  static int delete_impl(THD *thd, const char *name, const Table *dd_tab);
 
   /** Renames an InnoDB table.
   @tparam		Table		dd::Table or dd::Partition
@@ -984,8 +983,10 @@ class innobase_truncate {
   @param[in]	thd		THD object
   @param[in]	name		normalized table name
   @param[in]	form		Table format; columns and index information
-  @param[in]	dd_table	dd::Table or dd::Partition */
-  innobase_truncate(THD *thd, const char *name, TABLE *form, Table *dd_table)
+  @param[in]	dd_table	dd::Table or dd::Partition
+  @param[in]	keep_autoinc	true to remember original autoinc counter */
+  innobase_truncate(THD *thd, const char *name, TABLE *form, Table *dd_table,
+                    bool keep_autoinc)
       : m_thd(thd),
         m_name(name),
         m_dd_table(dd_table),
@@ -994,6 +995,7 @@ class innobase_truncate {
         m_form(form),
         m_create_info(),
         m_file_per_table(false),
+        m_keep_autoinc(keep_autoinc),
         m_flags(0),
         m_flags2(0) {}
 
@@ -1053,6 +1055,11 @@ class innobase_truncate {
 
   /** True if this table/partition is file per table */
   bool m_file_per_table;
+
+  /** True if the original autoinc counter should be kept. It's
+  specified by caller, however if the table has no AUTOINC column,
+  it would be reset to false internally */
+  bool m_keep_autoinc;
 
   /** flags of the table to be truncated, which should not change */
   uint64_t m_flags;

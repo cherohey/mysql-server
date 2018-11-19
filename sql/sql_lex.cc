@@ -38,6 +38,7 @@
 #include "mysqld_error.h"
 #include "prealloced_array.h"  // Prealloced_array
 #include "sql/current_thd.h"
+#include "sql/derror.h"
 #include "sql/item_func.h"
 #include "sql/mysqld.h"  // table_alias_charset
 #include "sql/nested_join.h"
@@ -62,6 +63,7 @@
 #include "sql/system_variables.h"
 #include "sql/table_function.h"
 #include "sql/window.h"
+#include "sql_update.h"  // Sql_cmd_update
 #include "template_utils.h"
 
 extern int HINT_PARSER_parse(THD *thd, Hint_scanner *scanner,
@@ -466,6 +468,7 @@ void LEX::reset() {
   opt_hints_global = NULL;
   binlog_need_explicit_defaults_ts = false;
   m_extended_show = false;
+  option_type = OPT_DEFAULT;
 
   clear_privileges();
 }
@@ -1161,6 +1164,11 @@ static bool consume_comment(Lex_input_stream *lip,
 
     if (remaining_recursions_permitted > 0) {
       if ((c == '/') && (lip->yyPeek() == '*')) {
+        push_warning(
+            lip->m_thd, Sql_condition::SL_WARNING,
+            ER_WARN_DEPRECATED_SYNTAX_NO_REPLACEMENT,
+            ER_THD(lip->m_thd, ER_WARN_DEPRECATED_NESTED_COMMENT_SYNTAX));
+
         lip->yySkip(); /* Eat asterisk */
         consume_comment(lip, remaining_recursions_permitted - 1);
         continue;
@@ -1424,12 +1432,10 @@ static int lex_one_token(YYSTYPE *yylval, THD *thd) {
 
         if (yylval->lex_str.str[0] == '_') {
           auto charset_name = yylval->lex_str.str + 1;
-          if (native_strcasecmp(charset_name, "utf8") == 0)
-            push_warning(thd, ER_DEPRECATED_UTF8_ALIAS);
-
-          const CHARSET_INFO *cs = get_charset_by_csname(
-              yylval->lex_str.str + 1, MY_CS_PRIMARY, MYF(0));
+          const CHARSET_INFO *cs =
+              get_charset_by_csname(charset_name, MY_CS_PRIMARY, MYF(0));
           if (cs) {
+            lip->warn_on_deprecated_charset(cs, charset_name);
             if (cs == &my_charset_utf8mb4_0900_ai_ci) {
               /*
                 If cs is utf8mb4, and the collation of cs is the default
@@ -1772,6 +1778,12 @@ static int lex_one_token(YYSTYPE *yylval, THD *thd) {
             break;
           }
         } else {
+          if (lip->in_comment != NO_COMMENT) {
+            push_warning(
+                lip->m_thd, Sql_condition::SL_WARNING,
+                ER_WARN_DEPRECATED_SYNTAX_NO_REPLACEMENT,
+                ER_THD(lip->m_thd, ER_WARN_DEPRECATED_NESTED_COMMENT_SYNTAX));
+          }
           lip->in_comment = PRESERVE_COMMENT;
           lip->yySkip();  // Accept /
           lip->yySkip();  // Accept *
@@ -2383,15 +2395,58 @@ void SELECT_LEX_UNIT::set_explain_marker_from(const SELECT_LEX_UNIT *u) {
 }
 
 ha_rows SELECT_LEX::get_offset() {
-  DBUG_ASSERT(offset_limit == NULL || offset_limit->fixed);
+  ulonglong val = 0;
 
-  return ha_rows(offset_limit ? offset_limit->val_uint() : 0ULL);
+  if (offset_limit) {
+    // see comment for st_select_lex::get_limit()
+    bool fix_fields_successful = true;
+    if (!offset_limit->fixed) {
+      fix_fields_successful = !offset_limit->fix_fields(master->thd, NULL);
+      DBUG_ASSERT(fix_fields_successful);
+    }
+    val = fix_fields_successful ? offset_limit->val_uint() : HA_POS_ERROR;
+  }
+
+  return ha_rows(val);
 }
 
 ha_rows SELECT_LEX::get_limit() {
-  DBUG_ASSERT(select_limit == NULL || select_limit->fixed);
+  ulonglong val = HA_POS_ERROR;
 
-  return ha_rows(select_limit ? select_limit->val_uint() : HA_POS_ERROR);
+  if (select_limit) {
+    /*
+      fix_fields() has not been called for select_limit. That's due to the
+      historical reasons -- this item could be only of type Item_int, and
+      Item_int does not require fix_fields(). Thus, fix_fields() was never
+      called for select_limit.
+
+      Some time ago, Item_splocal was also allowed for LIMIT / OFFSET clauses.
+      However, the fix_fields() behavior was not updated, which led to a crash
+      in some cases.
+
+      There is no single place where to call fix_fields() for LIMIT / OFFSET
+      items during the fix-fields-phase. Thus, for the sake of readability,
+      it was decided to do it here, on the evaluation phase (which is a
+      violation of design, but we chose the lesser of two evils).
+
+      We can call fix_fields() here, because select_limit can be of two
+      types only: Item_int and Item_splocal. Item_int::fix_fields() is trivial,
+      and Item_splocal::fix_fields() (or rather Item_sp_variable::fix_fields())
+      has the following properties:
+        1) it does not affect other items;
+        2) it does not fail.
+      Nevertheless DBUG_ASSERT was added to catch future changes in
+      fix_fields() implementation. Also added runtime check against a result
+      of fix_fields() in order to handle error condition in non-debug build.
+    */
+    bool fix_fields_successful = true;
+    if (!select_limit->fixed) {
+      fix_fields_successful = !select_limit->fix_fields(master->thd, NULL);
+      DBUG_ASSERT(fix_fields_successful);
+    }
+    val = fix_fields_successful ? select_limit->val_uint() : HA_POS_ERROR;
+  }
+  return ha_rows(val);
 }
 
 void SELECT_LEX::add_order_to_list(ORDER *order) {
@@ -2515,10 +2570,7 @@ void SELECT_LEX::print_order(String *str, ORDER *order,
                              enum_query_type query_type) {
   for (; order; order = order->next) {
     (*order->item)->print_for_order(str, query_type, order->used_alias);
-    if (order->direction == ORDER_DESC)
-      str->append(STRING_WITH_LEN(" desc"));
-    else if (order->is_explicit)
-      str->append(STRING_WITH_LEN(" asc"));
+    if (order->direction == ORDER_DESC) str->append(STRING_WITH_LEN(" desc"));
     if (order->next) str->append(',');
   }
 }
@@ -2797,6 +2849,34 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
   /* QQ: thd may not be set for sub queries, but this should be fixed */
   if (!thd) thd = current_thd;
 
+  if (select_number == 1) {
+    if (print_error(thd, str)) return;
+
+    switch (parent_lex->sql_command) {
+      case SQLCOM_UPDATE:  // Fall through
+      case SQLCOM_UPDATE_MULTI:
+        print_update(thd, str, query_type);
+        break;
+      case SQLCOM_DELETE:  // Fall through
+      case SQLCOM_DELETE_MULTI:
+        print_delete(thd, str, query_type);
+        break;
+      case SQLCOM_INSERT:  // Fall through
+      case SQLCOM_INSERT_SELECT:
+      case SQLCOM_REPLACE:
+      case SQLCOM_REPLACE_SELECT:
+        print_insert(thd, str, query_type);
+        break;
+      case SQLCOM_SELECT:  // Fall through
+      default:
+        print_select(thd, str, query_type);
+    }
+  } else
+    print_select(thd, str, query_type);
+}
+
+void SELECT_LEX::print_select(THD *thd, String *str,
+                              enum_query_type query_type) {
   if (query_type & QT_SHOW_SELECT_NUMBER) {
     /* it makes EXPLAIN's "id" column understandable */
     str->append("/* select#");
@@ -2808,14 +2888,123 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
   } else
     str->append(STRING_WITH_LEN("select "));
 
+  print_hints(thd, str, query_type);
+  print_select_options(str);
+  print_item_list(str, query_type);
+  print_from_clause(thd, str, query_type);
+  print_where_cond(str, query_type);
+  print_group_by(str, query_type);
+  print_having(str, query_type);
+  print_windows(thd, str, query_type);
+  print_order_by(str, query_type);
+  print_limit(str, query_type);
+  // PROCEDURE unsupported here
+}
+
+void SELECT_LEX::print_update(THD *thd, String *str,
+                              enum_query_type query_type) {
+  Sql_cmd_update *sql_cmd_update =
+      (static_cast<Sql_cmd_update *>(parent_lex->m_sql_cmd));
+  str->append(STRING_WITH_LEN("update "));
+  print_hints(thd, str, query_type);
+  print_update_options(str);
+  if (parent_lex->sql_command == SQLCOM_UPDATE) {
+    // Single table update
+    table_list.first->print(thd, str, query_type);  // table identifier
+    str->append(STRING_WITH_LEN(" set "));
+    print_update_list(str, query_type, item_list,
+                      *sql_cmd_update->update_value_list);
+    print_where_cond(str, query_type);
+    print_order_by(str, query_type);
+    print_limit(str, query_type);
+  } else {
+    // Multi table update
+    print_join(thd, str, &top_join_list, query_type);
+    str->append(STRING_WITH_LEN(" set "));
+    print_update_list(str, query_type, item_list,
+                      *sql_cmd_update->update_value_list);
+    print_where_cond(str, query_type);
+  }
+}
+
+void SELECT_LEX::print_delete(THD *thd, String *str,
+                              enum_query_type query_type) {
+  str->append(STRING_WITH_LEN("delete "));
+  print_hints(thd, str, query_type);
+  print_delete_options(str);
+  if (parent_lex->sql_command == SQLCOM_DELETE) {
+    // Single table delete
+    str->append(STRING_WITH_LEN("from "));
+    table_list.first->print(thd, str, query_type);  // table identifier
+    print_where_cond(str, query_type);
+    print_order_by(str, query_type);
+    print_limit(str, query_type);
+  } else {
+    // Multi table delete
+    print_table_references(thd, str, parent_lex->query_tables, query_type);
+    str->append(STRING_WITH_LEN(" from "));
+    print_join(thd, str, &top_join_list, query_type);
+    print_where_cond(str, query_type);
+  }
+}
+
+void SELECT_LEX::print_insert(THD *thd, String *str,
+                              enum_query_type query_type) {
+  /**
+    USES: 'INSERT INTO table (fields) VALUES values' syntax over
+    'INSERT INTO table SET field = value, ...'
+  */
+  if (parent_lex->sql_command == SQLCOM_REPLACE ||
+      parent_lex->sql_command == SQLCOM_REPLACE_SELECT)
+    str->append(STRING_WITH_LEN("replace "));
+  else
+    str->append(STRING_WITH_LEN("insert "));
+
+  // Don't print QB name hints since it will be printed through print_select.
+  print_hints(thd, str, enum_query_type(query_type | QT_IGNORE_QB_NAME));
+  print_insert_options(str);
+  str->append(STRING_WITH_LEN("into "));
+
+  TABLE_LIST *tbl = (parent_lex->insert_table_leaf)
+                        ? parent_lex->insert_table_leaf
+                        : table_list.first;
+  tbl->print(thd, str, query_type);  // table identifier
+
+  print_insert_fields(str, query_type);
+  str->append(STRING_WITH_LEN(" "));
+
+  if (parent_lex->sql_command == SQLCOM_INSERT ||
+      parent_lex->sql_command == SQLCOM_REPLACE) {
+    print_insert_values(str, query_type);
+  } else {
+    /*
+      Print only QB name hint here since other hints were printed in the
+      earlier call to print_hints.
+    */
+    print_select(thd, str, enum_query_type(query_type | QT_ONLY_QB_NAME));
+  }
+
+  Sql_cmd_insert_base *sql_cmd_insert =
+      static_cast<Sql_cmd_insert_base *>(parent_lex->m_sql_cmd);
+  if (sql_cmd_insert->update_field_list.elements > 0) {
+    str->append(STRING_WITH_LEN(" on duplicate key update "));
+    print_update_list(str, query_type, sql_cmd_insert->update_field_list,
+                      sql_cmd_insert->update_value_list);
+  }
+}
+
+void SELECT_LEX::print_hints(THD *thd, String *str,
+                             enum_query_type query_type) {
   if (thd->lex->opt_hints_global) {
     char buff[NAME_LEN];
     String hint_str(buff, sizeof(buff), system_charset_info);
     hint_str.length(0);
 
     if (select_number == 1) {
-      if (opt_hints_qb) opt_hints_qb->append_qb_hint(thd, &hint_str);
-      thd->lex->opt_hints_global->print(thd, &hint_str, query_type);
+      if (opt_hints_qb && !(query_type & QT_IGNORE_QB_NAME))
+        opt_hints_qb->append_qb_hint(thd, &hint_str);
+      if (!(query_type & QT_ONLY_QB_NAME))
+        thd->lex->opt_hints_global->print(thd, &hint_str, query_type);
     } else if (opt_hints_qb)
       opt_hints_qb->append_qb_hint(thd, &hint_str);
 
@@ -2825,25 +3014,30 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
       str->append(STRING_WITH_LEN("*/ "));
     }
   }
+}
 
+bool SELECT_LEX::print_error(THD *thd, String *str) {
   if (thd->is_error()) {
     /*
       It is possible that this query block had an optimization error, but the
-      caller didn't notice (caller evaluted this as a subquery and
-      Item::val*() don't have an error status). In this case the query block
-      may be broken and printing it may crash.
+      caller didn't notice (caller evaluted this as a subquery and Item::val*()
+      don't have an error status). In this case the query block may be broken
+      and printing it may crash.
     */
     str->append(STRING_WITH_LEN("had some error"));
-    return;
+    return true;
   }
   /*
-   In order to provide info for EXPLAIN FOR CONNECTION units shouldn't
-   be completely cleaned till the end of the query. This is valid only for
-   explainable commands.
+    In order to provide info for EXPLAIN FOR CONNECTION units shouldn't be
+    completely cleaned till the end of the query. This is valid only for
+    explainable commands.
   */
   DBUG_ASSERT(!(master_unit()->cleaned == SELECT_LEX_UNIT::UC_CLEAN &&
                 is_explainable_query(thd->lex->sql_command)));
+  return false;
+}
 
+void SELECT_LEX::print_select_options(String *str) {
   /* First add options */
   if (active_options() & SELECT_STRAIGHT_JOIN)
     str->append(STRING_WITH_LEN("straight_join "));
@@ -2859,18 +3053,84 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
     str->append(STRING_WITH_LEN("sql_buffer_result "));
   if (active_options() & OPTION_FOUND_ROWS)
     str->append(STRING_WITH_LEN("sql_calc_found_rows "));
+}
 
+void SELECT_LEX::print_update_options(String *str) {
+  if (table_list.first &&
+      table_list.first->mdl_request.type == MDL_SHARED_WRITE_LOW_PRIO)
+    str->append(STRING_WITH_LEN("low_priority "));
+  if (parent_lex->is_ignore()) str->append(STRING_WITH_LEN("ignore "));
+}
+
+void SELECT_LEX::print_delete_options(String *str) {
+  if (table_list.first &&
+      table_list.first->mdl_request.type == MDL_SHARED_WRITE_LOW_PRIO)
+    str->append(STRING_WITH_LEN("low_priority "));
+  if (active_options() & OPTION_QUICK) str->append(STRING_WITH_LEN("quick "));
+  if (parent_lex->is_ignore()) str->append(STRING_WITH_LEN("ignore "));
+}
+
+void SELECT_LEX::print_insert_options(String *str) {
+  if (table_list.first) {
+    int type = static_cast<int>(table_list.first->lock_descriptor().type);
+
+    // Lock option
+    if (type == static_cast<int>(TL_WRITE_LOW_PRIORITY))
+      str->append(STRING_WITH_LEN("low_priority "));
+    else if (type == static_cast<int>(TL_WRITE))
+      str->append(STRING_WITH_LEN("high_priority "));
+  }
+
+  if (parent_lex->is_ignore()) str->append(STRING_WITH_LEN("ignore "));
+}
+
+void SELECT_LEX::print_table_references(THD *thd, String *str,
+                                        TABLE_LIST *table_list,
+                                        enum_query_type query_type) {
+  bool first = true;
+  for (TABLE_LIST *tbl = table_list; tbl; tbl = tbl->next_local) {
+    if (tbl->updating) {
+      if (first)
+        first = false;
+      else
+        str->append(STRING_WITH_LEN(", "));
+
+      TABLE_LIST *t = tbl;
+
+      /*
+        Query Rewrite Plugin will not have is_view() set even for a view. This
+        is because operations like open_table haven't happend yet. So the
+        underlying target tables will not be added, only the original
+        table/view list will be reproduced. Ideally, it would be better if
+        TABLE_LIST::updatable_base_table() were used here, but that isn't
+        possible due to QRP.
+      */
+      while (t->is_view()) t = t->merge_underlying_list;
+
+      if (!(query_type & QT_NO_DB) &&
+          !((query_type & QT_NO_DEFAULT_DB) &&
+            db_is_default_db(t->db, t->db_length, thd))) {
+        append_identifier(thd, str, t->db, t->db_length);
+        str->append('.');
+      }
+      append_identifier(thd, str, t->table_name, t->table_name_length);
+    }
+  }
+}
+
+void SELECT_LEX::print_item_list(String *str, enum_query_type query_type) {
   // Item List
-  bool first = 1;
+  bool first = true;
   List_iterator_fast<Item> it(item_list);
   Item *item;
   while ((item = it++)) {
     if (first)
-      first = 0;
+      first = false;
     else
       str->append(',');
 
-    if (master_unit()->item && item->item_name.is_autogenerated()) {
+    if ((master_unit()->item && item->item_name.is_autogenerated()) ||
+        (query_type & QT_NORMALIZED_FORMAT)) {
       /*
         Do not print auto-generated aliases in subqueries. It has no purpose
         in a view definition or other contexts where the query is printed.
@@ -2880,10 +3140,75 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
       item->print_item_w_name(str, query_type);
     /** @note that 'INTO variable' clauses are not printed */
   }
+}
 
+void SELECT_LEX::print_update_list(String *str, enum_query_type query_type,
+                                   List<Item> fields, List<Item> values) {
+  List_iterator<Item> it_column(fields), it_value(values);
+  Item *column, *value;
+  bool first = true;
+  while ((column = it_column++) && (value = it_value++)) {
+    if (first)
+      first = false;
+    else
+      str->append(',');
+
+    column->print(str, query_type);
+    str->append(STRING_WITH_LEN(" = "));
+    value->print(str, enum_query_type(query_type & ~QT_NO_DATA_EXPANSION));
+  }
+}
+
+void SELECT_LEX::print_insert_fields(String *str, enum_query_type query_type) {
+  List<Item> fields = static_cast<Sql_cmd_insert_base *>(parent_lex->m_sql_cmd)
+                          ->insert_field_list;
+  if (fields.elements > 0) {
+    str->append(STRING_WITH_LEN(" ("));
+    List_iterator<Item> it_field(fields);
+    bool first = true;
+    while (Item *field = it_field++) {
+      if (first)
+        first = false;
+      else
+        str->append(',');
+
+      field->print(str, query_type);
+    }
+    str->append(')');
+  }
+}
+
+void SELECT_LEX::print_insert_values(String *str, enum_query_type query_type) {
+  str->append(STRING_WITH_LEN("values "));
+  List_iterator<List_item> it_row(
+      static_cast<Sql_cmd_insert_base *>(parent_lex->m_sql_cmd)
+          ->insert_many_values);
+  bool row_first = true;
+  while (List_item *row = it_row++) {
+    if (row_first)
+      row_first = false;
+    else
+      str->append(',');
+
+    str->append('(');
+    List_iterator<Item> it_col(*row);
+    bool col_first = true;
+    while (Item *item = it_col++) {
+      if (col_first)
+        col_first = false;
+      else
+        str->append(',');
+
+      item->print(str, query_type);
+    }
+    str->append(')');
+  }
+}
+
+void SELECT_LEX::print_from_clause(THD *thd, String *str,
+                                   enum_query_type query_type) {
   /*
     from clause
-    TODO: support USING/FORCE/IGNORE index
   */
   if (table_list.elements) {
     str->append(STRING_WITH_LEN(" from "));
@@ -2896,7 +3221,9 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
     */
     str->append(STRING_WITH_LEN(" from DUAL "));
   }
+}
 
+void SELECT_LEX::print_where_cond(String *str, enum_query_type query_type) {
   // Where
   Item *const cur_where =
       (join && join->is_optimized()) ? join->where_cond : m_where_cond;
@@ -2908,7 +3235,9 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
     else
       str->append(cond_value != Item::COND_FALSE ? "1" : "0");
   }
+}
 
+void SELECT_LEX::print_group_by(String *str, enum_query_type query_type) {
   // group by & olap
   if (group_list.elements) {
     str->append(STRING_WITH_LEN(" group by "));
@@ -2920,7 +3249,9 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
       default:;  // satisfy compiler
     }
   }
+}
 
+void SELECT_LEX::print_having(String *str, enum_query_type query_type) {
   // having
   Item *const cur_having = (join && join->having_for_explain != (Item *)1)
                                ? join->having_for_explain
@@ -2933,10 +3264,13 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
     else
       str->append(having_value != Item::COND_FALSE ? "1" : "0");
   }
+}
 
+void SELECT_LEX::print_windows(THD *thd, String *str,
+                               enum_query_type query_type) {
   List_iterator<Window> li(m_windows);
   Window *w;
-  first = true;
+  bool first = true;
   while ((w = li++)) {
     if (w->name() == nullptr) continue;  // will be printed with function
 
@@ -2952,16 +3286,13 @@ void SELECT_LEX::print(THD *thd, String *str, enum_query_type query_type) {
     str->append(" AS ");
     w->print(thd, str, query_type, true);
   }
+}
 
+void SELECT_LEX::print_order_by(String *str, enum_query_type query_type) {
   if (order_list.elements) {
     str->append(STRING_WITH_LEN(" order by "));
     print_order(str, order_list.first, query_type);
   }
-
-  // limit
-  print_limit(str, query_type);
-
-  // PROCEDURE unsupported here
 }
 
 static Item::enum_walk get_walk_flags(const Select_lex_visitor *visitor) {
@@ -2971,14 +3302,13 @@ static Item::enum_walk get_walk_flags(const Select_lex_visitor *visitor) {
     return Item::WALK_SUBQUERY_POSTFIX;
 }
 
-static bool walk_item(Item *item, Select_lex_visitor *visitor) {
+bool walk_item(Item *item, Select_lex_visitor *visitor) {
   if (item == NULL) return false;
   return item->walk(&Item::visitor_processor, get_walk_flags(visitor),
                     pointer_cast<uchar *>(visitor));
 }
 
-static bool accept_for_order(SQL_I_List<ORDER> orders,
-                             Select_lex_visitor *visitor) {
+bool accept_for_order(SQL_I_List<ORDER> orders, Select_lex_visitor *visitor) {
   if (orders.elements == 0) return false;
 
   for (ORDER *order = orders.first; order != NULL; order = order->next)
@@ -2997,17 +3327,21 @@ bool SELECT_LEX_UNIT::accept(Select_lex_visitor *visitor) {
   return visitor->visit(this);
 }
 
-static bool accept_for_join(List<TABLE_LIST> *tables,
-                            Select_lex_visitor *visitor) {
+bool accept_for_join(List<TABLE_LIST> *tables, Select_lex_visitor *visitor) {
   List_iterator<TABLE_LIST> ti(*tables);
-  TABLE_LIST *end = NULL;
-  for (TABLE_LIST *t = ti++; t != end; t = ti++) {
-    if (t->nested_join && accept_for_join(&t->nested_join->join_list, visitor))
-      return true;
-    else if (t->is_derived())
-      t->derived_unit()->accept(visitor);
-    if (walk_item(t->join_cond(), visitor)) return true;
+  TABLE_LIST *t;
+  while ((t = ti++)) {
+    if (accept_table(t, visitor)) return true;
   }
+  return false;
+}
+
+bool accept_table(TABLE_LIST *t, Select_lex_visitor *visitor) {
+  if (t->nested_join && accept_for_join(&t->nested_join->join_list, visitor))
+    return true;
+  else if (t->is_derived())
+    t->derived_unit()->accept(visitor);
+  if (walk_item(t->join_cond(), visitor)) return true;
   return false;
 }
 
@@ -3349,12 +3683,12 @@ bool SELECT_LEX_UNIT::set_limit(THD *thd_arg MY_ATTRIBUTE((unused)),
   /// @todo Remove THD from class SELECT_LEX_UNIT
   DBUG_ASSERT(this->thd == thd_arg);
   if (provider->offset_limit)
-    offset_limit_cnt = provider->offset_limit->val_uint();
+    offset_limit_cnt = provider->get_offset();
   else
     offset_limit_cnt = 0;
 
   if (provider->select_limit)
-    select_limit_cnt = provider->select_limit->val_uint();
+    select_limit_cnt = provider->get_limit();
   else
     select_limit_cnt = HA_POS_ERROR;
 
@@ -4216,25 +4550,8 @@ bool Query_options::save_to(Parse_context *pc) {
   return false;
 }
 
-/**
-  @todo This function is obviously incomplete. It does not walk update lists,
-  for instance. At the time of writing, however, this function has only a
-  single use, to walk all parts of select statements. If more functionality is
-  needed, it should be added here, in the same fashion as for SQLCOM_INSERT
-  below.
-*/
 bool LEX::accept(Select_lex_visitor *visitor) {
-  if (unit->accept(visitor)) return true;
-  if (sql_command == SQLCOM_INSERT) {
-    List_iterator<List_item> row_it(
-        static_cast<Sql_cmd_insert_base *>(m_sql_cmd)->insert_many_values);
-    for (List_item *row = row_it++; row != NULL; row = row_it++) {
-      List_iterator<Item> col_it(*row);
-      for (Item *item = col_it++; item != NULL; item = col_it++)
-        if (walk_item(item, visitor)) return true;
-    }
-  }
-  return false;
+  return m_sql_cmd->accept(thd, visitor);
 }
 
 bool LEX::set_wild(LEX_STRING w) {

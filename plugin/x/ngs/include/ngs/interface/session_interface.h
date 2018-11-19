@@ -22,12 +22,17 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
-#ifndef _NGS_SESSION_INTERFACE_H_
-#define _NGS_SESSION_INTERFACE_H_
+#ifndef PLUGIN_X_NGS_INCLUDE_NGS_INTERFACE_SESSION_INTERFACE_H_
+#define PLUGIN_X_NGS_INCLUDE_NGS_INTERFACE_SESSION_INTERFACE_H_
+
+#include <memory>
 
 #include "plugin/x/ngs/include/ngs/interface/authentication_interface.h"
+#include "plugin/x/ngs/include/ngs/interface/notice_configuration_interface.h"
+#include "plugin/x/ngs/include/ngs/interface/notice_output_queue_interface.h"
 #include "plugin/x/ngs/include/ngs/interface/protocol_encoder_interface.h"
 #include "plugin/x/ngs/include/ngs/interface/sql_session_interface.h"
+#include "plugin/x/ngs/include/ngs/notice_descriptor.h"
 #include "plugin/x/ngs/include/ngs/session_status_variables.h"
 
 namespace ngs {
@@ -69,7 +74,10 @@ class Session_interface {
   virtual State state_before_close() const = 0;
 
   virtual Client_interface &client() = 0;
+  virtual const Client_interface &client() const = 0;
 
+  virtual Notice_output_queue_interface &get_notice_output_queue() = 0;
+  virtual Notice_configuration_interface &get_notice_configuration() = 0;
   virtual Session_status_variables &get_status_variables() = 0;
   virtual void mark_as_tls_session() = 0;
   virtual THD *get_thd() const = 0;
@@ -79,4 +87,4 @@ class Session_interface {
 
 }  // namespace ngs
 
-#endif  // _NGS_SESSION_INTERFACE_H_
+#endif  // PLUGIN_X_NGS_INCLUDE_NGS_INTERFACE_SESSION_INTERFACE_H_

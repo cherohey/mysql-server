@@ -53,7 +53,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "lock0iter.h"
 #include "lock0lock.h"
 #include "mem0mem.h"
-#include "my_inttypes.h"
 #include "page0page.h"
 #include "rem0rec.h"
 #include "row0row.h"
@@ -583,6 +582,10 @@ static ulint put_nth_field(
   }
 
   /* now buf_size >= 1 */
+
+  /* Here any field must be part of index key, which should not be
+  added instantly, so no default value */
+  ut_ad(!rec_offs_nth_default(offsets, n));
 
   data = rec_get_nth_field(rec, offsets, n, &data_len);
 

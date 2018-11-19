@@ -39,13 +39,13 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ha_prototypes.h"
 #include "lock0lock.h"
 #include "lock0priv.h"
-#include "my_dbug.h"
-#include "my_inttypes.h"
 #include "os0thread-create.h"
 #include "que0que.h"
 #include "row0mysql.h"
 #include "srv0mon.h"
 #include "srv0start.h"
+
+#include "my_dbug.h"
 
 /** Print the contents of the lock_sys_t::waiting_threads array. */
 static void lock_wait_table_print(void) {
@@ -171,7 +171,6 @@ static srv_slot_t *lock_wait_table_reserve_slot(
   lock_wait_table_print();
 
   ut_error;
-  return (NULL);
 }
 
 /** Puts a user OS thread to wait for a lock to be released. If an error
@@ -443,9 +442,9 @@ static void lock_wait_check_and_cancel(
       lock_cancel_waiting_and_release(trx->lock.wait_lock, false);
     }
 
-    lock_mutex_exit();
-
     trx->owns_mutex = false;
+
+    lock_mutex_exit();
 
     trx_mutex_exit(trx);
   }

@@ -81,6 +81,8 @@ bool meb_replay_file_ops = true;
 #include "../meb/mutex.h"
 #endif /* !UNIV_HOTBACKUP */
 
+std::list<space_id_t> recv_encr_ts_list;
+
 /** Log records are stored in the hash table in chunks at most of this size;
 this must be less than UNIV_PAGE_SIZE as it is stored in the buffer pool */
 #define RECV_DATA_BLOCK_SIZE (MEM_MAX_ALLOC_IN_BUF - sizeof(recv_data_t))
@@ -388,6 +390,38 @@ void recv_sys_create() {
   recv_sys->spaces = nullptr;
 }
 
+/** Resize the recovery parsing buffer upto log_buffer_size */
+static bool recv_sys_resize_buf() {
+  ut_ad(recv_sys->buf_len <= srv_log_buffer_size);
+
+  /* If the buffer cannot be extended further, return false. */
+  if (recv_sys->buf_len == srv_log_buffer_size) {
+    ib::error(ER_IB_MSG_723, srv_log_buffer_size);
+    return false;
+  }
+
+  /* Extend the buffer by double the current size with the resulting
+  size not more than srv_log_buffer_size. */
+  recv_sys->buf_len = ((recv_sys->buf_len * 2) >= srv_log_buffer_size)
+                          ? srv_log_buffer_size
+                          : recv_sys->buf_len * 2;
+
+  /* Resize the buffer to the new size. */
+  recv_sys->buf =
+      static_cast<byte *>(ut_realloc(recv_sys->buf, recv_sys->buf_len));
+
+  ut_ad(recv_sys->buf != nullptr);
+
+  /* Return error and fail the recovery if not enough memory available */
+  if (recv_sys->buf == nullptr) {
+    ib::error(ER_IB_MSG_740);
+    return false;
+  }
+
+  ib::info(ER_IB_MSG_739, recv_sys->buf_len);
+  return true;
+}
+
 /** Free up recovery data structures. */
 static void recv_sys_finish() {
   if (recv_sys->spaces != nullptr) {
@@ -558,6 +592,7 @@ void recv_sys_init(ulint max_mem) {
   }
 
   recv_sys->buf = static_cast<byte *>(ut_malloc_nokey(RECV_PARSING_BUF_SIZE));
+  recv_sys->buf_len = RECV_PARSING_BUF_SIZE;
 
   recv_sys->len = 0;
   recv_sys->recovered_offset = 0;
@@ -841,7 +876,9 @@ void recv_sys_free() {
   if (!srv_read_only_mode) {
     ut_ad(!recv_recovery_on);
     ut_ad(!recv_writer_thread_active);
-    os_event_reset(buf_flush_event);
+    if (buf_flush_event != nullptr) {
+      os_event_reset(buf_flush_event);
+    }
     os_event_set(recv_sys->flush_start);
   }
 
@@ -1003,7 +1040,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   constexpr ulint CKP2 = LOG_CHECKPOINT_2;
 
   for (auto i = CKP1; i <= CKP2; i += CKP2 - CKP1) {
-    log_files_header_read(log, i);
+    log_files_header_read(log, static_cast<uint32_t>(i));
 
     if (!recv_check_log_header_checksum(buf)) {
       DBUG_PRINT("ib_log", ("invalid checkpoint, at %lu, checksum %x", i,
@@ -1451,7 +1488,8 @@ void meb_apply_log_record(recv_addr_t *recv_addr, buf_block_t *block) {
 
   buf_flush_init_for_writing(block, block->frame, buf_block_get_page_zip(block),
                              mach_read_from_8(block->frame + FIL_PAGE_LSN),
-                             fsp_is_checksum_disabled(block->page.id.space()));
+                             fsp_is_checksum_disabled(block->page.id.space()),
+                             true /* skip_lsn_check */);
 
   mutex_exit(&recv_sys->mutex);
 
@@ -1736,7 +1774,6 @@ static byte *recv_parse_or_apply_log_rec_body(
 
         fil_space_set_flags(space, mach_read_from_4(FSP_HEADER_OFFSET +
                                                     FSP_SPACE_FLAGS + page));
-
         fil_space_release(space);
 
         break;
@@ -1745,6 +1782,38 @@ static byte *recv_parse_or_apply_log_rec_body(
       // fall through
 
     case MLOG_1BYTE:
+      /* If 'ALTER TABLESPACE ... ENCRYPTION' was in progress and page 0 has
+      REDO entry for this, set encryption_op_in_progress flag now so that any
+      other page of this tablespace in redo log is written accordingly. */
+      if (page_no == 0 && page != nullptr && end_ptr >= ptr + 2) {
+        ulint offs = mach_read_from_2(ptr);
+
+        fil_space_t *space = fil_space_acquire(space_id);
+        ut_ad(space != nullptr);
+        ulint offset = fsp_header_get_encryption_progress_offset(
+            page_size_t(space->flags));
+
+        if (offs == offset) {
+          ptr = mlog_parse_nbytes(MLOG_1BYTE, ptr, end_ptr, page, page_zip);
+          byte op = mach_read_from_1(page + offset);
+          switch (op) {
+            case ENCRYPTION_IN_PROGRESS:
+              space->encryption_op_in_progress = ENCRYPTION;
+              break;
+            case UNENCRYPTION_IN_PROGRESS:
+              space->encryption_op_in_progress = UNENCRYPTION;
+              break;
+            default:
+              /* Don't reset operation in progress yet. It'll be done in
+              fsp_resume_encryption_unencryption(). */
+              break;
+          }
+        }
+        fil_space_release(space);
+      }
+
+      // fall through
+
     case MLOG_2BYTES:
     case MLOG_8BYTES:
 #ifdef UNIV_DEBUG
@@ -3016,7 +3085,7 @@ static bool recv_sys_add_to_parsing_buf(const byte *log_block,
 
     recv_sys->len += end_offset - start_offset;
 
-    ut_a(recv_sys->len <= RECV_PARSING_BUF_SIZE);
+    ut_a(recv_sys->len <= recv_sys->buf_len);
   }
 
   return (true);
@@ -3201,19 +3270,20 @@ bool meb_scan_log_recs(
       parsing buffer if parse_start_lsn is already
       non-zero */
 
-      if (recv_sys->len + 4 * OS_FILE_LOG_BLOCK_SIZE >= RECV_PARSING_BUF_SIZE) {
-        ib::error(ER_IB_MSG_723);
-
-        recv_sys->found_corrupt_log = true;
+      if (recv_sys->len + 4 * OS_FILE_LOG_BLOCK_SIZE >= recv_sys->buf_len) {
+        if (!recv_sys_resize_buf()) {
+          recv_sys->found_corrupt_log = true;
 
 #ifndef UNIV_HOTBACKUP
-        if (srv_force_recovery == 0) {
-          ib::error(ER_IB_MSG_724);
-          return (true);
-        }
+          if (srv_force_recovery == 0) {
+            ib::error(ER_IB_MSG_724);
+            return (true);
+          }
 #endif /* !UNIV_HOTBACKUP */
+        }
+      }
 
-      } else if (!recv_sys->found_corrupt_log) {
+      if (!recv_sys->found_corrupt_log) {
         more_data = recv_sys_add_to_parsing_buf(log_block, scanned_lsn);
       }
 
@@ -3256,7 +3326,7 @@ bool meb_scan_log_recs(
     }
 #endif /* !UNIV_HOTBACKUP */
 
-    if (recv_sys->recovered_offset > RECV_PARSING_BUF_SIZE / 4) {
+    if (recv_sys->recovered_offset > recv_sys->buf_len / 4) {
       /* Move parsing buffer data to the buffer start */
 
       recv_reset_buffer();
@@ -3438,7 +3508,7 @@ dberr_t recv_recovery_from_checkpoint_start(log_t &log, lsn_t flush_lsn) {
     return (err);
   }
 
-  log_files_header_read(log, max_cp_field);
+  log_files_header_read(log, static_cast<uint32_t>(max_cp_field));
 
   lsn_t checkpoint_lsn;
   checkpoint_no_t checkpoint_no;

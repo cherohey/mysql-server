@@ -52,12 +52,13 @@ enum dberr_t {
   DB_DEADLOCK,
   DB_ROLLBACK,
   DB_DUPLICATE_KEY,
-  DB_QUE_THR_SUSPENDED,
   DB_MISSING_HISTORY, /*!< required history data has been
                       deleted due to lack of space in
                       rollback segment */
   DB_SKIP_LOCKED,     /*!< skip lock */
   DB_LOCK_NOWAIT,     /*!< don't wait lock */
+  DB_NO_SESSION_TEMP, /*!< no session temporary tablespace
+                      could be allocated */
 
   DB_CLUSTER_NOT_FOUND = 30,
   DB_TABLE_NOT_FOUND,

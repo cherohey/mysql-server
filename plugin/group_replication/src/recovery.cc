@@ -30,9 +30,9 @@
 #include "my_systime.h"
 #include "plugin/group_replication/include/member_info.h"
 #include "plugin/group_replication/include/plugin.h"
+#include "plugin/group_replication/include/plugin_messages/recovery_message.h"
 #include "plugin/group_replication/include/recovery.h"
 #include "plugin/group_replication/include/recovery_channel_state_observer.h"
-#include "plugin/group_replication/include/recovery_message.h"
 #include "plugin/group_replication/include/services/notification/notification.h"
 
 using std::list;
@@ -124,15 +124,17 @@ int Recovery_module::stop_recovery() {
   while (recovery_thd_state.is_thread_alive()) {
     DBUG_PRINT("loop", ("killing group replication recovery thread"));
 
-    mysql_mutex_lock(&recovery_thd->LOCK_thd_data);
+    if (recovery_thd_state.is_initialized()) {
+      mysql_mutex_lock(&recovery_thd->LOCK_thd_data);
 
-    recovery_thd->awake(THD::NOT_KILLED);
-    mysql_mutex_unlock(&recovery_thd->LOCK_thd_data);
+      recovery_thd->awake(THD::NOT_KILLED);
+      mysql_mutex_unlock(&recovery_thd->LOCK_thd_data);
 
-    // Break the wait for the applier suspension
-    applier_module->interrupt_applier_suspension_wait();
-    // Break the state transfer process
-    recovery_state_transfer.abort_state_transfer();
+      // Break the wait for the applier suspension
+      applier_module->interrupt_applier_suspension_wait();
+      // Break the state transfer process
+      recovery_state_transfer.abort_state_transfer();
+    }
 
     /*
       There is a small chance that thread might miss the first
@@ -186,6 +188,10 @@ void Recovery_module::leave_group_on_recovery_failure() {
   /* Single state update. Notify right away. */
   notify_and_reset_ctx(ctx);
 
+  if (view_change_notifier != NULL &&
+      !view_change_notifier->is_view_modification_ongoing()) {
+    view_change_notifier->start_view_modification();
+  }
   Gcs_operations::enum_leave_state state = gcs_module->leave();
 
   char **error_message = NULL;
@@ -219,9 +225,21 @@ void Recovery_module::leave_group_on_recovery_failure() {
       break;
       /* purecov: end */
     case Gcs_operations::NOW_LEAVING:
-      return;
+      break;
   }
-  LogPluginErr(log_severity, errcode);
+  if (errcode) LogPluginErr(log_severity, errcode);
+
+  if (view_change_notifier != NULL) {
+    LogPluginErr(INFORMATION_LEVEL, ER_GRP_RPL_WAITING_FOR_VIEW_UPDATE);
+    if (view_change_notifier->wait_for_view_modification()) {
+      LogPluginErr(WARNING_LEVEL,
+                   ER_GRP_RPL_TIMEOUT_RECEIVING_VIEW_CHANGE_ON_SHUTDOWN);
+    }
+  }
+
+  if (exit_state_action_var == EXIT_STATE_ACTION_ABORT_SERVER) {
+    abort_plugin_process("Fatal error during execution of Group Replication");
+  }
 }
 
 /*
@@ -273,6 +291,9 @@ int Recovery_module::recovery_thread_handle() {
   int error = 0;
 
   set_recovery_thread_context();
+  mysql_mutex_lock(&run_lock);
+  recovery_thd_state.set_initialized();
+  mysql_mutex_unlock(&run_lock);
 
   // take this before the start method returns
   size_t number_of_members = group_member_mgr->get_number_of_members();
@@ -390,10 +411,10 @@ cleanup:
   clean_recovery_thread_context();
 
   mysql_mutex_lock(&run_lock);
-  delete recovery_thd;
 
   recovery_aborted = true;  // to avoid the start missing signals
   recovery_thd_state.set_terminated();
+  delete recovery_thd;
   mysql_cond_broadcast(&run_cond);
   mysql_mutex_unlock(&run_lock);
 

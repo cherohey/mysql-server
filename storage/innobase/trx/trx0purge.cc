@@ -1002,10 +1002,13 @@ static void trx_purge_initiate_truncate(purge_iter_t *limit,
                   ib::info(ER_IB_MSG_1168) << "ib_undo_trunc_before_checkpoint";
                   DBUG_SUICIDE(););
 
-  /* After truncate if server crashes then redo logging done for this
-  undo tablespace might not stand valid as tablespace has been
-  truncated. */
-  log_make_latest_checkpoint();
+  /* Since we are about to delete the current file, invalidate all
+  its buffer pages from the buffer pool. */
+  FlushObserver *old_space_flush_observer = UT_NEW_NOKEY(
+      FlushObserver(undo_trunc->get_marked_space_id(), nullptr, nullptr));
+  old_space_flush_observer->interrupted();
+  old_space_flush_observer->flush();
+  UT_DELETE(old_space_flush_observer);
 
   ib::info(ER_IB_MSG_1169) << "Truncating UNDO tablespace number "
                            << undo::id2num(undo_trunc->get_marked_space_id());
@@ -1043,7 +1046,11 @@ static void trx_purge_initiate_truncate(purge_iter_t *limit,
                       << "ib_undo_trunc_before_ddl_log_end";
                   DBUG_SUICIDE(););
 
-  log_make_latest_checkpoint();
+  /* Flush all the buffer pages for this new undo tablespace to disk. */
+  FlushObserver *new_space_flush_observer = UT_NEW_NOKEY(
+      FlushObserver(undo_trunc->get_marked_space_id(), nullptr, nullptr));
+  new_space_flush_observer->flush();
+  UT_DELETE(new_space_flush_observer);
 
   undo::done_logging(undo_trunc->get_marked_space_id());
 
@@ -1517,6 +1524,10 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
   que_thr_t *thr;
   ulint n_pages_handled = 0;
 
+#ifdef UNIV_DEBUG
+  std::set<table_id_t> all_table_ids;
+#endif /* UNIV_DEBUG */
+
   ut_a(n_purge_threads > 0);
   ut_a(n_purge_threads <= MAX_PURGE_THREADS);
 
@@ -1587,6 +1598,10 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
 
     table_id = trx_undo_rec_get_table_id(rec.undo_rec);
 
+#ifdef UNIV_DEBUG
+    all_table_ids.insert(table_id);
+#endif /* UNIV_DEBUG */
+
     GroupBy::iterator lb = group_by.lower_bound(table_id);
 
     if (lb != group_by.end() && !(group_by.key_comp()(table_id, lb->first))) {
@@ -1634,6 +1649,28 @@ static ulint trx_purge_attach_undo_recs(const ulint n_purge_threads,
       }
     }
   }
+
+#ifdef UNIV_DEBUG
+  {
+    /* Add validation routine to check whether undo records of same table id
+    is being processed by different purge threads concurrently. */
+
+    for (auto xter = all_table_ids.begin(); xter != all_table_ids.end();
+         ++xter) {
+      table_id_t tid = *xter;
+      std::vector<bool> table_exists;
+
+      for (ulint i = 0; i < n_purge_threads; ++i) {
+        purge_node_t *node = static_cast<purge_node_t *>(run_thrs[i]->child);
+        ut_ad(node->check_duplicate_undo_no());
+        table_exists.push_back(node->is_table_id_exists(tid));
+      }
+
+      ptrdiff_t N = std::count(table_exists.begin(), table_exists.end(), true);
+      ut_ad(N == 0 || N == 1);
+    }
+  }
+#endif /* UNIV_DEBUG */
 
   ut_ad(trx_purge_check_limit());
 

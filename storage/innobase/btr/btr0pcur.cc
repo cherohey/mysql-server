@@ -35,7 +35,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <stddef.h>
 
 #include "my_dbug.h"
-#include "my_inttypes.h"
+
 #include "rem0cmp.h"
 #include "trx0trx.h"
 #include "ut0byte.h"
@@ -317,7 +317,6 @@ ibool btr_pcur_restore_position_func(
       break;
     default:
       ut_error;
-      mode = PAGE_CUR_UNSUPP;
   }
 
   btr_pcur_open_with_no_init_func(index, tuple, mode, latch_mode, cursor, 0,

@@ -698,6 +698,15 @@ static bool dd_upgrade_partitions(THD *thd, const char *norm_name,
                         << "Part table name from server: " << partition_name
                         << " from InnoDB: " << part_table->name.m_name;);
 
+    if (DICT_TF_HAS_SHARED_SPACE(part_table->flags)) {
+      ib::error(ER_IB_MSG_1282)
+          << "Partitioned table '" << part_table->name.m_name
+          << "' is not allowed to use shared tablespace '"
+          << part_table->tablespace << "'. Please move all "
+          << "partitions to file-per-table tablespaces before upgrade.";
+      return (true);
+    }
+
     /* Set table id */
     part_obj->set_se_private_id(part_table->id);
 
@@ -859,6 +868,12 @@ bool dd_upgrade_table(THD *thd, const char *db_name, const char *table_name,
   if (failure) {
     dict_table_close(ib_table, false, false);
     return (failure);
+  }
+
+  /* Set table id to mysql.columns as runtime */
+  for (auto dd_column : *dd_table->table().columns()) {
+    dd_column->se_private_data().set_uint64(dd_index_key_strings[DD_TABLE_ID],
+                                            ib_table->id);
   }
 
   dd::Object_id dd_space_id;
@@ -1318,7 +1333,12 @@ static void dd_upgrade_fts_rename_cleanup(bool failed_upgrade) {
       fts_upgrade_rename(ib_table, failed_upgrade);
 
       mutex_enter(&dict_sys->mutex);
-      dict_table_allow_eviction(ib_table);
+
+      /* Do not mark the table ready for eviction if there is
+      a foreign key relationship on this table */
+      if (ib_table->foreign_set.empty() && ib_table->referenced_set.empty()) {
+        dict_table_allow_eviction(ib_table);
+      }
       dict_table_close(ib_table, true, false);
       mutex_exit(&dict_sys->mutex);
     }

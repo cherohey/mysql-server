@@ -60,6 +60,8 @@
 #include "mysql/psi/mysql_memory.h"
 #include "mysql/psi/mysql_mutex.h"
 #include "mysql/psi/mysql_rwlock.h"
+#include "mysql/psi/mysql_system.h"
+#include "mysql/psi/mysql_thread.h"
 #include "mysql/psi/psi_base.h"
 #include "mysql/service_mysql_alloc.h"
 #include "mysql_com.h"
@@ -87,6 +89,7 @@
 #include "sql/protocol_classic.h"
 #include "sql/psi_memory_key.h"
 #include "sql/records.h"  // READ_RECORD
+#include "sql/row_iterator.h"
 #include "sql/set_var.h"
 #include "sql/sql_audit.h"        // mysql_audit_acquire_plugins
 #include "sql/sql_backup_lock.h"  // acquire_shared_backup_lock
@@ -290,6 +293,7 @@
 #endif
 
 #include <algorithm>
+#include <memory>
 #include <new>
 #include <unordered_map>
 #include <utility>
@@ -493,8 +497,29 @@ static void report_error(int where_to, uint error, ...) {
     va_end(args);
   }
   if (where_to & REPORT_TO_LOG) {
+    longlong ecode = 0;
+    switch (error) {
+      case ER_UDF_NO_PATHS:
+        ecode = ER_NO_PATH_FOR_SHARED_LIBRARY;
+        break;
+      case ER_CANT_OPEN_LIBRARY:
+        ecode = ER_FAILED_TO_OPEN_SHARED_LIBRARY;
+        break;
+      case ER_CANT_FIND_DL_ENTRY:
+        ecode = ER_FAILED_TO_FIND_DL_ENTRY;
+        break;
+      case ER_OUTOFMEMORY:
+        ecode = ER_SERVER_OUTOFMEMORY;
+        break;
+      case ER_UDF_EXISTS:
+        ecode = ER_UDF_ALREADY_EXISTS;
+        break;
+      default:
+        DBUG_ASSERT(false);
+        return;
+    }
     va_start(args, error);
-    error_log_printf(ERROR_LEVEL, ER_DEFAULT(error), args);
+    LogEvent().type(LOG_TYPE_ERROR).prio(ERROR_LEVEL).lookupv(ecode, args);
     va_end(args);
   }
 }
@@ -563,8 +588,13 @@ static inline void free_plugin_mem(st_plugin_dl *p) {
   bool preserve_shared_objects_after_unload = false;
   DBUG_EXECUTE_IF("preserve_shared_objects_after_unload",
                   { preserve_shared_objects_after_unload = true; });
-  if (p->handle != nullptr && !preserve_shared_objects_after_unload)
+  if (p->handle != nullptr && !preserve_shared_objects_after_unload) {
+#ifdef HAVE_PSI_SYSTEM_INTERFACE
+    PSI_SYSTEM_CALL(unload_plugin)
+    (std::string(p->dl.str, p->dl.length).c_str());
+#endif
     dlclose(p->handle);
+  }
   my_free(p->dl.str);
   if (p->version != MYSQL_PLUGIN_INTERFACE_VERSION) my_free(p->plugins);
 }
@@ -1614,7 +1644,6 @@ static void plugin_load(MEM_ROOT *tmp_root, int *argc, char **argv) {
   THD thd;
   TABLE_LIST tables;
   TABLE *table;
-  READ_RECORD read_record_info;
   int error;
   THD *new_thd = &thd;
   bool result;
@@ -1635,7 +1664,9 @@ static void plugin_load(MEM_ROOT *tmp_root, int *argc, char **argv) {
     DBUG_VOID_RETURN;
   }
   table = tables.table;
-  if (init_read_record(&read_record_info, new_thd, table, NULL, 1, 1, false)) {
+  READ_RECORD read_record_info;
+  if (init_read_record(&read_record_info, new_thd, table, NULL, false,
+                       /*ignore_not_found_rows=*/false)) {
     close_trans_system_tables(new_thd);
     DBUG_VOID_RETURN;
   }
@@ -1646,7 +1677,7 @@ static void plugin_load(MEM_ROOT *tmp_root, int *argc, char **argv) {
     environment, and it uses mysql_mutex_assert_owner(), so we lock
     the mutex here to satisfy the assert
   */
-  while (!(error = read_record_info.read_record(&read_record_info))) {
+  while (!(error = read_record_info->Read())) {
     DBUG_PRINT("info", ("init plugin record"));
     String str_name, str_dl;
     get_field(tmp_root, table->field[0], &str_name);
@@ -1679,7 +1710,7 @@ static void plugin_load(MEM_ROOT *tmp_root, int *argc, char **argv) {
     LogErr(ERROR_LEVEL, ER_GET_ERRNO_FROM_STORAGE_ENGINE, my_errno(),
            my_strerror(errbuf, MYSQL_ERRMSG_SIZE, my_errno()));
   }
-  end_read_record(&read_record_info);
+  read_record_info.iterator.reset();
   table->m_needs_reopen = true;  // Force close to free memory
 
   close_trans_system_tables(new_thd);
@@ -1717,7 +1748,7 @@ static bool plugin_load_list(MEM_ROOT *tmp_root, int *argc, char **argv,
     switch ((*(p++) = *(list++))) {
       case '\0':
         list = NULL; /* terminate the loop */
-        /* fall through */
+                     /* fall through */
       case ';':
 #ifndef _WIN32
       case ':': /* can't use this as delimiter as it may be drive letter */
@@ -2129,6 +2160,11 @@ static bool mysql_install_plugin(THD *thd, const LEX_STRING *name,
         error = true;
     } else
       error = true;
+
+    if (error) {
+      report_error(REPORT_TO_USER, ER_PLUGIN_INSTALL_ERROR, name->str,
+                   "error acquiring metadata lock");
+    }
   }
 
   /*
@@ -2144,7 +2180,12 @@ static bool mysql_install_plugin(THD *thd, const LEX_STRING *name,
     table->field[1]->store(dl->str, dl->length, files_charset_info);
     error = table->file->ha_write_row(table->record[0]);
     if (error) {
-      table->file->print_error(error, MYF(0));
+      const char msg[] = "got '%s' writing to mysql.plugin";
+      char buf[MYSQL_ERRMSG_SIZE + sizeof(msg) - 2];
+      char errbuf[MYSQL_ERRMSG_SIZE];
+      my_strerror(errbuf, sizeof(errbuf), error);
+      snprintf(buf, sizeof(buf), msg, errbuf);
+      report_error(REPORT_TO_USER, ER_PLUGIN_INSTALL_ERROR, name->str, buf);
     } else {
       mysql_mutex_lock(&LOCK_plugin);
 
@@ -2159,8 +2200,13 @@ static bool mysql_install_plugin(THD *thd, const LEX_STRING *name,
         tables are closed before the function returns.
        */
       error = error || thd->transaction_rollback_request;
-      if (!error && store_infoschema_metadata)
+      if (!error && store_infoschema_metadata) {
         error = dd::info_schema::store_dynamic_plugin_I_S_metadata(thd, tmp);
+        if (error) {
+          report_error(REPORT_TO_USER, ER_PLUGIN_INSTALL_ERROR, name->str,
+                       "error storing metadata");
+        }
+      }
       mysql_mutex_unlock(&LOCK_plugin);
 
       if (!error && store_infoschema_metadata) {
@@ -2168,6 +2214,10 @@ static bool mysql_install_plugin(THD *thd, const LEX_STRING *name,
         error = update_referencing_views_metadata(
             thd, INFORMATION_SCHEMA_NAME.str, tmp->name.str, false,
             &uncommitted_tables);
+        if (error) {
+          report_error(REPORT_TO_USER, ER_PLUGIN_INSTALL_ERROR, name->str,
+                       "error updating metadata");
+        }
       }
     }
   }
@@ -2389,15 +2439,22 @@ static bool mysql_uninstall_plugin(THD *thd, const LEX_STRING *name) {
     Disable_binlog_guard binlog_guard(thd);
     rc = table->file->ha_delete_row(table->record[0]);
     if (rc) {
-      table->file->print_error(rc, MYF(0));
       DBUG_ASSERT(thd->is_error());
     } else
       error = false;
   } else if (rc != HA_ERR_KEY_NOT_FOUND && rc != HA_ERR_END_OF_FILE) {
-    table->file->print_error(rc, MYF(0));
     DBUG_ASSERT(thd->is_error());
   } else
     error = false;
+
+  if (error) {
+    const char msg[] = "got '%s' deleting from mysql.plugin";
+    char buf[MYSQL_ERRMSG_SIZE + sizeof(msg) - 2];
+    char errbuf[MYSQL_ERRMSG_SIZE];
+    my_strerror(errbuf, sizeof(errbuf), error);
+    snprintf(buf, sizeof(buf), msg, errbuf);
+    report_error(REPORT_TO_USER, ER_PLUGIN_UNINSTALL_ERROR, name->str, buf);
+  }
 
   if (!error && !thd->transaction_rollback_request &&
       remove_IS_metadata_from_dd) {
@@ -2411,6 +2468,11 @@ static bool mysql_uninstall_plugin(THD *thd, const LEX_STRING *name) {
       error = update_referencing_views_metadata(
           thd, INFORMATION_SCHEMA_NAME.str, orig_plugin_name.c_str(), false,
           &uncommitted_tables);
+    }
+
+    if (error) {
+      report_error(REPORT_TO_USER, ER_PLUGIN_UNINSTALL_ERROR, name->str,
+                   "error updating metadata");
     }
   }
 
@@ -2738,16 +2800,12 @@ static int *mysql_sys_var_int(THD *thd, int offset) {
   return (int *)intern_sys_var_ptr(thd, offset, true);
 }
 
-static long *mysql_sys_var_long(THD *thd, int offset) {
-  return (long *)intern_sys_var_ptr(thd, offset, true);
+static unsigned int *mysql_sys_var_uint(THD *thd, int offset) {
+  return (unsigned int *)intern_sys_var_ptr(thd, offset, true);
 }
 
 static unsigned long *mysql_sys_var_ulong(THD *thd, int offset) {
   return (unsigned long *)intern_sys_var_ptr(thd, offset, true);
-}
-
-static long long *mysql_sys_var_longlong(THD *thd, int offset) {
-  return (long long *)intern_sys_var_ptr(thd, offset, true);
 }
 
 static unsigned long long *mysql_sys_var_ulonglong(THD *thd, int offset) {
@@ -3042,13 +3100,25 @@ static int construct_options(MEM_ROOT *mem_root, st_plugin_int *tmp,
         ((thdvar_bool_t *)opt)->resolve = mysql_sys_var_bool;
         break;
       case PLUGIN_VAR_INT:
-        ((thdvar_int_t *)opt)->resolve = mysql_sys_var_int;
+        // All PLUGIN_VAR_INT variables are actually uint,
+        // see struct System_variables
+        // Except: plugin variables declared with MYSQL_THDVAR_INT,
+        // which may actually be signed.
+        if (((thdvar_int_t *)opt)->offset == -1 &&
+            !(opt->flags & PLUGIN_VAR_UNSIGNED))
+          ((thdvar_int_t *)opt)->resolve = mysql_sys_var_int;
+        else
+          ((thdvar_uint_t *)opt)->resolve = mysql_sys_var_uint;
         break;
       case PLUGIN_VAR_LONG:
-        ((thdvar_long_t *)opt)->resolve = mysql_sys_var_long;
+        // All PLUGIN_VAR_LONG variables are actually ulong,
+        // see struct System_variables
+        ((thdvar_ulong_t *)opt)->resolve = mysql_sys_var_ulong;
         break;
       case PLUGIN_VAR_LONGLONG:
-        ((thdvar_longlong_t *)opt)->resolve = mysql_sys_var_longlong;
+        // All PLUGIN_VAR_LONGLONG variables are actually ulonglong,
+        // see struct System_variables
+        ((thdvar_ulonglong_t *)opt)->resolve = mysql_sys_var_ulonglong;
         break;
       case PLUGIN_VAR_STR:
         ((thdvar_str_t *)opt)->resolve = mysql_sys_var_str;
@@ -3349,7 +3419,7 @@ static int test_plugin_options(MEM_ROOT *tmp_root, st_plugin_int *tmp,
   for (opt = tmp->plugin->system_vars; opt && *opt; opt++) {
     SYS_VAR *o;
     const my_option **optp = (const my_option **)&opts;
-    if (((o = *opt)->flags & PLUGIN_VAR_EXPERIMENTAL)) continue;
+    if (((o = *opt)->flags & PLUGIN_VAR_NOSYSVAR)) continue;
     if ((var = find_bookmark(plugin_name.str, o->name, o->flags)))
       v = new (mem_root) sys_var_pluginvar(&chain, var->key + 1, o);
     else {

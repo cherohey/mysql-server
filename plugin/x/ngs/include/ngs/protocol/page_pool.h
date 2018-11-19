@@ -22,8 +22,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
-#ifndef _NGS_PAGE_POOL_H_
-#define _NGS_PAGE_POOL_H_
+#ifndef PLUGIN_X_NGS_INCLUDE_NGS_PROTOCOL_PAGE_POOL_H_
+#define PLUGIN_X_NGS_INCLUDE_NGS_PROTOCOL_PAGE_POOL_H_
 
 #include <stdint.h>
 #include <atomic>
@@ -31,6 +31,7 @@
 
 #include "plugin/x/ngs/include/ngs/memory.h"
 #include "plugin/x/ngs/include/ngs/thread.h"
+#include "plugin/x/src/helper/multithread/mutex.h"
 
 #define BUFFER_PAGE_SIZE 4096
 
@@ -151,7 +152,7 @@ class Page_pool {
   int32_t m_pages_cache_max;
   int32_t m_pages_cached;
   const int32_t m_page_size;
-  Mutex m_mutex;
+  xpl::Mutex m_mutex;
   std::atomic<int32_t> m_pages_allocated;
 };
 
@@ -185,4 +186,4 @@ ResType *Resource<ResType>::operator->() const {
 }
 }  // namespace ngs
 
-#endif  // _NGS_PAGE_POOL_H_
+#endif  // PLUGIN_X_NGS_INCLUDE_NGS_PROTOCOL_PAGE_POOL_H_

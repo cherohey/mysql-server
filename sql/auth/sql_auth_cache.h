@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -155,6 +155,11 @@ class ACL_USER : public ACL_ACCESS {
   */
   bool use_default_password_reuse_interval;
 
+  /**
+    The current password needed to be specified while changing it.
+  */
+  Lex_acl_attrib_udyn password_require_current;
+
   ACL_USER *copy(MEM_ROOT *root);
 };
 
@@ -281,6 +286,36 @@ class GRANT_TABLE : public GRANT_NAME {
   bool ok() { return privs != 0 || cols != 0; }
 };
 
+/*
+ * A default/no-arg constructor is useful with containers-of-containers
+ * situations in which a two-allocator scoped_allocator_adapter is not enough.
+ * This custom allocator provides a Malloc_allocator with a no-arg constructor
+ * by hard-coding the key_memory_acl_cache constructor argument.
+ * This "solution" lacks beauty, yet is pragmatic.
+ */
+template <class T>
+class Acl_cache_allocator : public Malloc_allocator<T> {
+ public:
+  Acl_cache_allocator() : Malloc_allocator<T>(key_memory_acl_cache) {}
+  template <class U>
+  struct rebind {
+    typedef Acl_cache_allocator<U> other;
+  };
+
+  template <class U>
+  Acl_cache_allocator(
+      const Acl_cache_allocator<U> &other MY_ATTRIBUTE((unused)))
+      : Malloc_allocator<T>(key_memory_acl_cache) {}
+
+  template <class U>
+  Acl_cache_allocator &operator=(
+      const Acl_cache_allocator<U> &other MY_ATTRIBUTE((unused))) {}
+};
+typedef Acl_cache_allocator<ACL_USER *> Acl_user_ptr_allocator;
+typedef std::list<ACL_USER *, Acl_user_ptr_allocator> Acl_user_ptr_list;
+Acl_user_ptr_list *cached_acl_users_for_name(const char *name);
+void rebuild_cached_acl_users_for_name(void);
+
 /* Data Structures */
 
 extern MEM_ROOT global_acl_memory;
@@ -380,10 +415,10 @@ typedef boost::property<boost::vertex_acl_user_t, ACL_USER,
 typedef boost::property<boost::edge_capacity_t, int> Role_edge_properties;
 
 /** A graph of all users/roles privilege inheritance */
-typedef boost::adjacency_list<boost::setS,       // OutEdges
-                              boost::vecS,       // Vertices
-                              boost::directedS,  // Directed graph
-                              Role_properties,   // Vertex props
+typedef boost::adjacency_list<boost::setS,            // OutEdges
+                              boost::vecS,            // Vertices
+                              boost::bidirectionalS,  // Directed graph
+                              Role_properties,        // Vertex props
                               Role_edge_properties>
     Granted_roles_graph;
 
@@ -397,6 +432,17 @@ typedef boost::graph_traits<Granted_roles_graph>::edge_descriptor
 
 /** The datatype of the map between authids and graph vertex descriptors */
 typedef std::unordered_map<std::string, Role_vertex_descriptor> Role_index_map;
+
+/** The type used for the number of edges incident to a vertex in the graph. */
+using degree_s_t = boost::graph_traits<Granted_roles_graph>::degree_size_type;
+
+/** The type for the iterator returned by out_edges(). */
+using out_edge_itr_t =
+    boost::graph_traits<Granted_roles_graph>::out_edge_iterator;
+
+/** The type for the iterator returned by in_edges(). */
+using in_edge_itr_t =
+    boost::graph_traits<Granted_roles_graph>::in_edge_iterator;
 
 /** Container for global, schema, table/view and routine ACL maps */
 class Acl_map {

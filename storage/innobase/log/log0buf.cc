@@ -614,13 +614,32 @@ static void log_wait_for_space_after_reserving(log_t &log,
   log_wait_for_space_in_log_buf(log, end_sn);
 }
 
-void log_wait_for_space_in_log_file(log_t &log, sn_t end_sn) {
-  auto stop_condition = [&log, end_sn](bool) {
+sn_t log_free_check_margin(const log_t &log) {
+  sn_t margins = log.concurrency_margin.load();
 
-    const sn_t chkp_sn =
-        log_translate_lsn_to_sn(log.last_checkpoint_lsn.load());
+  margins += log.dict_persist_margin.load();
 
-    return (end_sn <= chkp_sn + log.sn_capacity);
+  return (margins);
+}
+
+void log_free_check_wait(log_t &log, sn_t sn) {
+  auto stop_condition = [&log, sn](bool) {
+
+    const sn_t margins = log_free_check_margin(log);
+
+    const lsn_t start_lsn = log_translate_sn_to_lsn(sn + margins);
+
+    const lsn_t checkpoint_lsn = log.last_checkpoint_lsn.load();
+
+    if (start_lsn <= checkpoint_lsn + log.lsn_capacity_for_free_check) {
+      /* No reason to wait anymore. */
+      return (true);
+    }
+
+    log_request_checkpoint(log, true,
+                           start_lsn - log.lsn_capacity_for_free_check);
+
+    return (false);
   };
 
   const auto wait_stats = ut_wait_for(0, 100, stop_condition);
@@ -903,19 +922,14 @@ void log_buffer_write_completed(log_t &log, const Log_handle &handle,
   log.recent_written.add_link(start_lsn, end_lsn);
 }
 
-void log_buffer_write_completed_before_dirty_pages_added(
-    log_t &log, const Log_handle &handle) {
-  const lsn_t start_lsn = handle.start_lsn;
+void log_wait_for_space_in_log_recent_closed(const log_t &log, lsn_t lsn) {
+  ut_a(log_lsn_validate(lsn));
 
-  ut_a(log_lsn_validate(start_lsn));
-
-  ut_ad(start_lsn >= log_buffer_dirty_pages_added_up_to_lsn(log));
-
-  ut_ad(log.sn_lock.s_own(handle.lock_no));
+  ut_ad(lsn >= log_buffer_dirty_pages_added_up_to_lsn(log));
 
   uint64_t wait_loops = 0;
 
-  while (!log.recent_closed.has_space(start_lsn)) {
+  while (!log.recent_closed.has_space(lsn)) {
     ++wait_loops;
     os_thread_sleep(20);
   }
@@ -925,8 +939,7 @@ void log_buffer_write_completed_before_dirty_pages_added(
   }
 }
 
-void log_buffer_write_completed_and_dirty_pages_added(
-    log_t &log, const Log_handle &handle) {
+void log_buffer_close(log_t &log, const Log_handle &handle) {
   const lsn_t start_lsn = handle.start_lsn;
   const lsn_t end_lsn = handle.end_lsn;
 
